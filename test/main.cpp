@@ -33,6 +33,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // ----------------------------------------------------------------------------
 // 读取文件到内存
@@ -2846,12 +2847,13 @@ void test_tableswitch_default() {
 }
 
 // ============================================================================
-// Main
+// 回归测试入口
+// 被 src/main.cpp 的 --test 模式调用
 // ============================================================================
 
-int main(int argc, char** argv) {
+int run_regression_tests(int argc, char** argv) {
     printf("========================================\n");
-    printf("  Mini JVM - Phase 8: Long/Switch/Ref\n");
+    printf("  Mini JVM - Regression Tests\n");
     printf("========================================\n\n");
 
     // Phase 1 基础测试
@@ -2866,11 +2868,16 @@ int main(int argc, char** argv) {
     test_klass();
 
     // Phase 3 完整流程
-    if (argc > 1) {
-        test_full_pipeline(argv[1]);
-    } else {
-        test_full_pipeline("test/HelloWorld.class");
+    // 注意：argc/argv 来自真实 main()，argv[1] 可能是 "--test"
+    // 检查是否有非 "--test" 的参数作为 .class 文件路径
+    const char* class_file = "test/HelloWorld.class";
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test") != 0) {
+            class_file = argv[i];
+            break;
+        }
     }
+    test_full_pipeline(class_file);
 
     // Phase 4 测试
     test_bytecodes();
@@ -2881,11 +2888,7 @@ int main(int argc, char** argv) {
     test_interpreter_branch();
 
     // Phase 4 终极测试：解析 + 执行 HelloWorld.class
-    if (argc > 1) {
-        test_full_execution(argv[1]);
-    } else {
-        test_full_execution("test/HelloWorld.class");
-    }
+    test_full_execution(class_file);
 
     // Phase 5 测试
     test_java_heap_basic();
@@ -2917,7 +2920,7 @@ int main(int argc, char** argv) {
     test_tableswitch_default();
 
     printf("========================================\n");
-    printf("  All Phase 8 tests completed!\n");
+    printf("  All regression tests completed!\n");
     printf("========================================\n");
 
     return 0;

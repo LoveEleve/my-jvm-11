@@ -26,16 +26,19 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/cpu/x86
 )
 
-# 收集源文件
-file(GLOB_RECURSE SOURCES
+# 收集源文件（不含入口文件）
+file(GLOB_RECURSE LIB_SOURCES
     "src/share/*.cpp"
     "src/os/linux/*.cpp"
     "src/cpu/x86/*.cpp"
 )
 
-# 主程序（暂时用 test/main.cpp 做入口）
+# ═══ 主程序：真正的 JVM 入口 ═══
+# 入口: src/main.cpp
+# 回归测试: test/main.cpp（通过 --test 参数触发）
 add_executable(mini_jvm
-    ${SOURCES}
+    ${LIB_SOURCES}
+    src/main.cpp
     test/main.cpp
 )
 

@@ -1,7 +1,7 @@
 // ============================================================================
-// Mini JVM - Phase 6 测试入口
+// Mini JVM - Phase 7 测试入口
 // 测试 OOP-Klass 对象模型 + 字节码解释器 + 对象创建 + 字段访问
-// + 真实 <init> 构造函数 + 实例方法调用
+// + 真实 <init> 构造函数 + 实例方法调用 + 数组支持
 // ============================================================================
 
 #include "utilities/globalDefinitions.hpp"
@@ -19,6 +19,9 @@
 #include "oops/method.hpp"
 #include "oops/klass.hpp"
 #include "oops/instanceKlass.hpp"
+#include "oops/arrayOop.hpp"
+#include "oops/typeArrayOop.hpp"
+#include "oops/typeArrayKlass.hpp"
 #include "classfile/classFileStream.hpp"
 #include "classfile/classFileParser.hpp"
 #include "interpreter/bytecodes.hpp"
@@ -1723,12 +1726,506 @@ void test_init_with_args() {
 }
 
 // ============================================================================
+// Phase 7 测试：数组支持
+// ============================================================================
+
+// ---- Test 1: TypeArrayKlass 基础 + 直接 API ----
+// 验证 TypeArrayKlass 初始化、数组分配、元素读写
+void test_type_array_klass_basic() {
+    printf("=== Test: Phase 7 - TypeArrayKlass Basic ===\n");
+
+    JavaHeap::initialize(1024 * 1024);  // 1MB
+    TypeArrayKlass::initialize_all();
+
+    // 检查各种类型的 TypeArrayKlass 都存在
+    vm_assert(TypeArrayKlass::for_type(T_INT)     != nullptr, "int[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_BYTE)    != nullptr, "byte[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_CHAR)    != nullptr, "char[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_LONG)    != nullptr, "long[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_FLOAT)   != nullptr, "float[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_DOUBLE)  != nullptr, "double[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_SHORT)   != nullptr, "short[] klass");
+    vm_assert(TypeArrayKlass::for_type(T_BOOLEAN) != nullptr, "boolean[] klass");
+
+    // 分配 int[5]
+    TypeArrayKlass* int_klass = TypeArrayKlass::for_type(T_INT);
+    printf("  int[] klass: name=%s, element_size=%d\n",
+           int_klass->name(), int_klass->element_size());
+
+    typeArrayOopDesc* arr = int_klass->allocate_array(5);
+    vm_assert(arr != nullptr, "array allocated");
+    vm_assert(arr->length() == 5, "length should be 5");
+    vm_assert(arr->klass() == int_klass, "klass should match");
+
+    // 写入并读回
+    arr->int_at_put(0, 10);
+    arr->int_at_put(1, 20);
+    arr->int_at_put(2, 30);
+    arr->int_at_put(3, 40);
+    arr->int_at_put(4, 50);
+
+    vm_assert(arr->int_at(0) == 10, "arr[0]=10");
+    vm_assert(arr->int_at(4) == 50, "arr[4]=50");
+
+    // 验证数组大小
+    // int[5]: header(24) + 5*4(20) = 44 → aligned to 48
+    int expected_size = int_klass->array_size_in_bytes(5);
+    printf("  int[5] size: %d bytes (header=%d, data=%d)\n",
+           expected_size, arrayOopDesc::header_size_in_bytes(), 5 * 4);
+    vm_assert(expected_size == 48, "int[5] should be 48 bytes");
+
+    // 分配 byte[10]
+    TypeArrayKlass* byte_klass = TypeArrayKlass::for_type(T_BYTE);
+    typeArrayOopDesc* barr = byte_klass->allocate_array(10);
+    vm_assert(barr != nullptr, "byte array allocated");
+    vm_assert(barr->length() == 10, "byte array length 10");
+
+    barr->byte_at_put(0, 'H');
+    barr->byte_at_put(1, 'i');
+    vm_assert(barr->byte_at(0) == 'H', "barr[0]='H'");
+    vm_assert(barr->byte_at(1) == 'i', "barr[1]='i'");
+
+    TypeArrayKlass::destroy_all();
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 7 - TypeArrayKlass Basic OK\n\n");
+}
+
+// ---- Test 2: newarray + iastore + iaload 字节码 ----
+// Java 等价代码：
+//   int[] arr = new int[3];
+//   arr[0] = 10;
+//   arr[1] = 20;
+//   arr[2] = 30;
+//   return arr[0] + arr[1] + arr[2];  // → 60
+void test_newarray_int() {
+    printf("=== Test: Phase 7 - newarray int + iastore/iaload ===\n");
+
+    JavaHeap::initialize(1024 * 1024);
+    TypeArrayKlass::initialize_all();
+
+    // 构建字节码：
+    // 0: iconst_3
+    // 1: newarray T_INT(10)
+    // 3: astore_1
+    //
+    // 4: aload_1
+    // 5: iconst_0
+    // 6: bipush 10
+    // 8: iastore
+    //
+    // 9: aload_1
+    // 10: iconst_1
+    // 11: bipush 20
+    // 13: iastore
+    //
+    // 14: aload_1
+    // 15: iconst_2
+    // 16: bipush 30
+    // 18: iastore
+    //
+    // 19: aload_1
+    // 20: iconst_0
+    // 21: iaload
+    //
+    // 22: aload_1
+    // 23: iconst_1
+    // 24: iaload
+    //
+    // 25: iadd
+    //
+    // 26: aload_1
+    // 27: iconst_2
+    // 28: iaload
+    //
+    // 29: iadd
+    //
+    // 30: ireturn
+
+    u1 bytecodes[] = {
+        0x06,                         //  0: iconst_3
+        (u1)Bytecodes::_newarray, 10, //  1: newarray T_INT
+        (u1)Bytecodes::_astore_1,     //  3: astore_1
+
+        (u1)Bytecodes::_aload_1,      //  4: aload_1
+        (u1)Bytecodes::_iconst_0,     //  5: iconst_0
+        (u1)Bytecodes::_bipush, 10,   //  6: bipush 10
+        (u1)Bytecodes::_iastore,      //  8: iastore
+
+        (u1)Bytecodes::_aload_1,      //  9: aload_1
+        (u1)Bytecodes::_iconst_1,     // 10: iconst_1
+        (u1)Bytecodes::_bipush, 20,   // 11: bipush 20
+        (u1)Bytecodes::_iastore,      // 13: iastore
+
+        (u1)Bytecodes::_aload_1,      // 14: aload_1
+        (u1)Bytecodes::_iconst_2,     // 15: iconst_2
+        (u1)Bytecodes::_bipush, 30,   // 16: bipush 30
+        (u1)Bytecodes::_iastore,      // 18: iastore
+
+        (u1)Bytecodes::_aload_1,      // 19: aload_1
+        (u1)Bytecodes::_iconst_0,     // 20: iconst_0
+        (u1)Bytecodes::_iaload,       // 21: iaload
+
+        (u1)Bytecodes::_aload_1,      // 22: aload_1
+        (u1)Bytecodes::_iconst_1,     // 23: iconst_1
+        (u1)Bytecodes::_iaload,       // 24: iaload
+
+        (u1)Bytecodes::_iadd,         // 25: iadd
+
+        (u1)Bytecodes::_aload_1,      // 26: aload_1
+        (u1)Bytecodes::_iconst_2,     // 27: iconst_2
+        (u1)Bytecodes::_iaload,       // 28: iaload
+
+        (u1)Bytecodes::_iadd,         // 29: iadd
+        (u1)Bytecodes::_ireturn,      // 30: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+
+    // 创建 Method（不需要常量池，数组字节码不用 cp）
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 4, 2, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // 创建一个最小的 InstanceKlass（只用于提供 cp）
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/ArrayTest");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    // 执行
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 60)\n", result.get_jint());
+    vm_assert(result.get_jint() == 60, "arr[0]+arr[1]+arr[2] should be 60");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+    TypeArrayKlass::destroy_all();
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 7 - newarray int + iastore/iaload OK\n\n");
+}
+
+// ---- Test 3: arraylength 字节码 ----
+// Java 等价代码：
+//   int[] arr = new int[7];
+//   return arr.length;  // → 7
+void test_arraylength() {
+    printf("=== Test: Phase 7 - arraylength ===\n");
+
+    JavaHeap::initialize(1024 * 1024);
+    TypeArrayKlass::initialize_all();
+
+    // 0: bipush 7
+    // 2: newarray T_INT(10)
+    // 4: arraylength
+    // 5: ireturn
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_bipush, 7,
+        (u1)Bytecodes::_newarray, 10,  // T_INT
+        (u1)Bytecodes::_arraylength,
+        (u1)Bytecodes::_ireturn,
+    };
+
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, sizeof(bytecodes), 2, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, sizeof(bytecodes));
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/ArrayLen");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 7)\n", result.get_jint());
+    vm_assert(result.get_jint() == 7, "arraylength should be 7");
+
+    delete method;
+    delete ik;
+    TypeArrayKlass::destroy_all();
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 7 - arraylength OK\n\n");
+}
+
+// ---- Test 4: byte 数组 (bastore/baload) ----
+// Java 等价代码：
+//   byte[] arr = new byte[3];
+//   arr[0] = 100;
+//   arr[1] = 50;
+//   arr[2] = -10;
+//   return arr[0] + arr[1] + arr[2];  // → 140
+void test_byte_array() {
+    printf("=== Test: Phase 7 - byte array (bastore/baload) ===\n");
+
+    JavaHeap::initialize(1024 * 1024);
+    TypeArrayKlass::initialize_all();
+
+    // 0: iconst_3
+    // 1: newarray T_BYTE(8)
+    // 3: astore_1
+    //
+    // 4: aload_1
+    // 5: iconst_0
+    // 6: bipush 100
+    // 8: bastore
+    //
+    // 9: aload_1
+    // 10: iconst_1
+    // 11: bipush 50
+    // 13: bastore
+    //
+    // 14: aload_1
+    // 15: iconst_2
+    // 16: bipush -10   (0xF6 as signed byte)
+    // 18: bastore
+    //
+    // 19: aload_1
+    // 20: iconst_0
+    // 21: baload
+    //
+    // 22: aload_1
+    // 23: iconst_1
+    // 24: baload
+    //
+    // 25: iadd
+    //
+    // 26: aload_1
+    // 27: iconst_2
+    // 28: baload
+    //
+    // 29: iadd
+    //
+    // 30: ireturn
+
+    u1 bytecodes[] = {
+        0x06,                         //  0: iconst_3
+        (u1)Bytecodes::_newarray, 8,  //  1: newarray T_BYTE
+        (u1)Bytecodes::_astore_1,     //  3: astore_1
+
+        (u1)Bytecodes::_aload_1,      //  4
+        (u1)Bytecodes::_iconst_0,     //  5
+        (u1)Bytecodes::_bipush, 100,  //  6
+        (u1)Bytecodes::_bastore,      //  8
+
+        (u1)Bytecodes::_aload_1,      //  9
+        (u1)Bytecodes::_iconst_1,     // 10
+        (u1)Bytecodes::_bipush, 50,   // 11
+        (u1)Bytecodes::_bastore,      // 13
+
+        (u1)Bytecodes::_aload_1,      // 14
+        (u1)Bytecodes::_iconst_2,     // 15
+        (u1)Bytecodes::_bipush, (u1)(jbyte)-10,  // 16: bipush -10
+        (u1)Bytecodes::_bastore,      // 18
+
+        (u1)Bytecodes::_aload_1,      // 19
+        (u1)Bytecodes::_iconst_0,     // 20
+        (u1)Bytecodes::_baload,       // 21
+
+        (u1)Bytecodes::_aload_1,      // 22
+        (u1)Bytecodes::_iconst_1,     // 23
+        (u1)Bytecodes::_baload,       // 24
+
+        (u1)Bytecodes::_iadd,         // 25
+
+        (u1)Bytecodes::_aload_1,      // 26
+        (u1)Bytecodes::_iconst_2,     // 27
+        (u1)Bytecodes::_baload,       // 28
+
+        (u1)Bytecodes::_iadd,         // 29
+        (u1)Bytecodes::_ireturn,      // 30
+    };
+
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, sizeof(bytecodes), 4, 2, 0, 0);
+    cm->set_bytecodes(bytecodes, sizeof(bytecodes));
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/ByteArrayTest");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    // 100 + 50 + (-10) = 140
+    printf("  Result: %d (expected 140)\n", result.get_jint());
+    vm_assert(result.get_jint() == 140, "100+50+(-10) should be 140");
+
+    delete method;
+    delete ik;
+    TypeArrayKlass::destroy_all();
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 7 - byte array OK\n\n");
+}
+
+// ---- Test 5: 数组用于循环累加 ----
+// Java 等价代码：
+//   int[] arr = new int[4];
+//   arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4;
+//   int sum = 0;
+//   int i = 0;
+//   while (i < 4) { sum += arr[i]; i++; }
+//   return sum;  // → 10
+void test_array_loop_sum() {
+    printf("=== Test: Phase 7 - Array Loop Sum ===\n");
+
+    JavaHeap::initialize(1024 * 1024);
+    TypeArrayKlass::initialize_all();
+
+    // local[0] = (unused)
+    // local[1] = arr (int[4])
+    // local[2] = sum
+    // local[3] = i
+    //
+    // Bytecode:
+    //  0: iconst_4
+    //  1: newarray 10 (T_INT)
+    //  3: astore_1
+    //
+    //  4: aload_1 / iconst_0 / iconst_1 / iastore     (arr[0]=1)
+    //  8: aload_1 / iconst_1 / iconst_2 / iastore     (arr[1]=2)
+    // 12: aload_1 / iconst_2 / iconst_3 / iastore     (arr[2]=3)
+    // 16: aload_1 / iconst_3 / iconst_4 / iastore     (arr[3]=4)
+    //
+    // 20: iconst_0 / istore_2                          (sum=0)
+    // 22: iconst_0 / istore_3                          (i=0)
+    //
+    // 24: iload_3                                      (loop start)
+    // 25: iconst_4
+    // 26: if_icmpge +14 → 40                           (if i>=4 goto end)
+    //
+    // 29: iload_2                                      (sum)
+    // 30: aload_1                                      (arr)
+    // 31: iload_3                                      (i)
+    // 32: iaload                                       (arr[i])
+    // 33: iadd                                         (sum + arr[i])
+    // 34: istore_2                                     (sum = ...)
+    //
+    // 35: iinc 3 1                                     (i++)
+    // 38: goto -14 → 24                                (goto loop)
+    //
+    // 40: iload_2                                      (load sum)
+    // 41: ireturn
+
+    u1 bytecodes[] = {
+        // 创建数组
+        0x07,                                   //  0: iconst_4
+        (u1)Bytecodes::_newarray, 10,           //  1: newarray T_INT
+        (u1)Bytecodes::_astore_1,               //  3: astore_1
+
+        // arr[0]=1
+        (u1)Bytecodes::_aload_1,                //  4: aload_1
+        (u1)Bytecodes::_iconst_0,               //  5: iconst_0
+        (u1)Bytecodes::_iconst_1,               //  6: iconst_1
+        (u1)Bytecodes::_iastore,                //  7: iastore
+
+        // arr[1]=2
+        (u1)Bytecodes::_aload_1,                //  8: aload_1
+        (u1)Bytecodes::_iconst_1,               //  9: iconst_1
+        (u1)Bytecodes::_iconst_2,               // 10: iconst_2
+        (u1)Bytecodes::_iastore,                // 11: iastore
+
+        // arr[2]=3
+        (u1)Bytecodes::_aload_1,                // 12: aload_1
+        (u1)Bytecodes::_iconst_2,               // 13: iconst_2
+        (u1)Bytecodes::_iconst_3,               // 14: iconst_3
+        (u1)Bytecodes::_iastore,                // 15: iastore
+
+        // arr[3]=4
+        (u1)Bytecodes::_aload_1,                // 16: aload_1
+        (u1)Bytecodes::_iconst_3,               // 17: iconst_3
+        (u1)Bytecodes::_iconst_4,               // 18: iconst_4
+        (u1)Bytecodes::_iastore,                // 19: iastore
+
+        // sum=0
+        (u1)Bytecodes::_iconst_0,               // 20: iconst_0
+        (u1)Bytecodes::_istore_2,               // 21: istore_2
+
+        // i=0
+        (u1)Bytecodes::_iconst_0,               // 22: iconst_0
+        (u1)Bytecodes::_istore_3,               // 23: istore_3
+
+        // loop: if (i >= 4) goto end (BCI 41)
+        (u1)Bytecodes::_iload_3,                // 24: iload_3
+        (u1)Bytecodes::_iconst_4,               // 25: iconst_4
+        (u1)Bytecodes::_if_icmpge, 0x00, 15,    // 26: if_icmpge +15 → 41
+
+        // sum += arr[i]
+        (u1)Bytecodes::_iload_2,                // 29: iload_2
+        (u1)Bytecodes::_aload_1,                // 30: aload_1
+        (u1)Bytecodes::_iload_3,                // 31: iload_3
+        (u1)Bytecodes::_iaload,                 // 32: iaload
+        (u1)Bytecodes::_iadd,                   // 33: iadd
+        (u1)Bytecodes::_istore_2,               // 34: istore_2
+
+        // i++
+        (u1)Bytecodes::_iinc, 3, 1,             // 35: iinc 3 1
+
+        // goto loop (BCI 24)
+        (u1)Bytecodes::_goto, 0xFF, 0xF2,       // 38: goto -14 → 24
+
+        // end
+        (u1)Bytecodes::_iload_2,                // 41: iload_2
+        (u1)Bytecodes::_ireturn,                // 42: ireturn
+    };
+
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, sizeof(bytecodes), 4, 4, 0, 0);
+    cm->set_bytecodes(bytecodes, sizeof(bytecodes));
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/ArrayLoop");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = false;  // 循环太长，不打印
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+
+    printf("  Result: %d (expected 10)\n", result.get_jint());
+    vm_assert(result.get_jint() == 10, "sum should be 1+2+3+4=10");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+    TypeArrayKlass::destroy_all();
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 7 - Array Loop Sum OK\n\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char** argv) {
     printf("========================================\n");
-    printf("  Mini JVM - Phase 6: Method Calls\n");
+    printf("  Mini JVM - Phase 7: Arrays\n");
     printf("========================================\n\n");
 
     // Phase 1 基础测试
@@ -1770,14 +2267,21 @@ int main(int argc, char** argv) {
     test_interpreter_object_creation();
     test_interpreter_static_fields();
 
-    // Phase 6 新增测试
+    // Phase 6 测试
     test_init_constructor();
     test_invokevirtual_instance_method();
     test_multiple_method_calls();
     test_init_with_args();
 
+    // Phase 7 新增测试
+    test_type_array_klass_basic();
+    test_newarray_int();
+    test_arraylength();
+    test_byte_array();
+    test_array_loop_sum();
+
     printf("========================================\n");
-    printf("  All Phase 6 tests completed!\n");
+    printf("  All Phase 7 tests completed!\n");
     printf("========================================\n");
 
     return 0;

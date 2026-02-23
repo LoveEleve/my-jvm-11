@@ -361,7 +361,16 @@ public:
             case _invokespecial:   return "invokespecial";
             case _invokestatic:    return "invokestatic";
             case _new:          return "new";
+            case _newarray:     return "newarray";
             case _arraylength:  return "arraylength";
+            case _iaload:       return "iaload";
+            case _iastore:      return "iastore";
+            case _baload:       return "baload";
+            case _bastore:      return "bastore";
+            case _caload:       return "caload";
+            case _castore:      return "castore";
+            case _saload:       return "saload";
+            case _sastore:      return "sastore";
             case _athrow:       return "athrow";
             case _checkcast:    return "checkcast";
             case _instanceof:   return "instanceof";

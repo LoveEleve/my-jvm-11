@@ -9,6 +9,8 @@
 
 #include "interpreter/bytecodeInterpreter.hpp"
 #include "gc/shared/javaHeap.hpp"
+#include "oops/typeArrayKlass.hpp"
+#include "oops/typeArrayOop.hpp"
 
 bool BytecodeInterpreter::_trace_bytecodes = false;
 
@@ -726,6 +728,214 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
             handle_new(frame, klass, thread, cp_index);
             if (thread->has_pending_exception()) return;
             frame->advance_bcp(3);
+            break;
+        }
+
+        // ================================================================
+        // 数组操作（Phase 7）
+        // ================================================================
+
+        case Bytecodes::_newarray: {
+            // newarray atype
+            // 操作数栈: ..., count → ..., arrayref
+            u1 atype = frame->read_u1_operand(1);
+            jint count = frame->pop_int();
+
+            if (count < 0) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.NegativeArraySizeException");
+                return;
+            }
+
+            TypeArrayKlass* tak = TypeArrayKlass::for_atype(atype);
+            if (tak == nullptr) {
+                fprintf(stderr, "ERROR: newarray — unknown atype %d\n", atype);
+                thread->set_pending_exception(nullptr, "Unknown array type");
+                return;
+            }
+
+            typeArrayOopDesc* arr = tak->allocate_array(count);
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.OutOfMemoryError: Java heap space");
+                return;
+            }
+
+            if (_trace_bytecodes) {
+                fprintf(stderr, "  [NEWARRAY] atype=%d, count=%d, %s at %p (%d bytes)\n",
+                        atype, count, tak->name(), (void*)arr,
+                        tak->array_size_in_bytes(count));
+            }
+
+            frame->push_oop((oopDesc*)arr);
+            frame->advance_bcp(2);
+            break;
+        }
+
+        case Bytecodes::_arraylength: {
+            // arraylength
+            // 操作数栈: ..., arrayref → ..., length
+            oopDesc* arr_oop = frame->pop_oop();
+            if (arr_oop == nullptr) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.NullPointerException");
+                return;
+            }
+            arrayOopDesc* arr = (arrayOopDesc*)arr_oop;
+            frame->push_int(arr->length());
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_iaload: {
+            // iaload: ..., arrayref, index → ..., value
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                fprintf(stderr, "ERROR: ArrayIndexOutOfBoundsException: index=%d, length=%d\n",
+                        index, arr->length());
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            frame->push_int(arr->int_at(index));
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_iastore: {
+            // iastore: ..., arrayref, index, value → ...
+            jint value = frame->pop_int();
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                fprintf(stderr, "ERROR: ArrayIndexOutOfBoundsException: index=%d, length=%d\n",
+                        index, arr->length());
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            arr->int_at_put(index, value);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_baload: {
+            // baload: ..., arrayref, index → ..., value (byte/boolean)
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            frame->push_int((jint)arr->byte_at(index));
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_bastore: {
+            // bastore: ..., arrayref, index, value → ...
+            jint value = frame->pop_int();
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            arr->byte_at_put(index, (jbyte)value);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_caload: {
+            // caload: ..., arrayref, index → ..., value (char)
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            frame->push_int((jint)arr->char_at(index));
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_castore: {
+            // castore: ..., arrayref, index, value → ...
+            jint value = frame->pop_int();
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            arr->char_at_put(index, (jchar)value);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_saload: {
+            // saload: ..., arrayref, index → ..., value (short)
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            frame->push_int((jint)arr->short_at(index));
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_sastore: {
+            // sastore: ..., arrayref, index, value → ...
+            jint value = frame->pop_int();
+            jint index = frame->pop_int();
+            typeArrayOopDesc* arr = (typeArrayOopDesc*)frame->pop_oop();
+            if (arr == nullptr) {
+                thread->set_pending_exception(nullptr, "java.lang.NullPointerException");
+                return;
+            }
+            if (index < 0 || index >= arr->length()) {
+                thread->set_pending_exception(nullptr,
+                    "java.lang.ArrayIndexOutOfBoundsException");
+                return;
+            }
+            arr->short_at_put(index, (jshort)value);
+            frame->advance_bcp(1);
             break;
         }
 

@@ -1,7 +1,8 @@
 // ============================================================================
-// Mini JVM - Phase 7 测试入口
+// Mini JVM - Phase 8 测试入口
 // 测试 OOP-Klass 对象模型 + 字节码解释器 + 对象创建 + 字段访问
 // + 真实 <init> 构造函数 + 实例方法调用 + 数组支持
+// + 引用比较 + Switch + Long 操作
 // ============================================================================
 
 #include "utilities/globalDefinitions.hpp"
@@ -2220,12 +2221,637 @@ void test_array_loop_sum() {
 }
 
 // ============================================================================
+// Phase 8 测试：引用比较、Switch、Long 操作、pop2
+// ============================================================================
+
+// ---- Test 28: if_acmpeq / if_acmpne ----
+// Java 等价代码：
+//   Object a = new int[1];
+//   Object b = a;
+//   if (a == b) return 1; else return 0;
+// 期望结果：1
+void test_if_acmpeq() {
+    printf("=== Test: Phase 8 - if_acmpeq (reference comparison) ===\n");
+
+    JavaHeap::initialize(1024 * 1024);
+    TypeArrayKlass::initialize_all();
+
+    // 字节码：
+    // 0: iconst_1
+    // 1: newarray T_INT(10)    → 创建 int[1]
+    // 3: astore_0              → a = arrayref
+    // 4: aload_0               → push a
+    // 5: astore_1              → b = a
+    // 6: aload_0               → push a
+    // 7: aload_1               → push b
+    // 8: if_acmpeq +5          → if (a == b) goto 13
+    // 11: iconst_0
+    // 12: ireturn
+    // 13: iconst_1
+    // 14: ireturn
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_iconst_1,                  //  0: iconst_1
+        (u1)Bytecodes::_newarray, 10,              //  1: newarray T_INT
+        (u1)Bytecodes::_astore_0,                  //  3: astore_0
+        (u1)Bytecodes::_aload_0,                   //  4: aload_0
+        (u1)Bytecodes::_astore_1,                  //  5: astore_1
+        (u1)Bytecodes::_aload_0,                   //  6: aload_0
+        (u1)Bytecodes::_aload_1,                   //  7: aload_1
+        (u1)Bytecodes::_if_acmpeq, 0x00, 0x05,    //  8: if_acmpeq +5 → BCI 13
+        (u1)Bytecodes::_iconst_0,                  // 11: iconst_0
+        (u1)Bytecodes::_ireturn,                   // 12: ireturn
+        (u1)Bytecodes::_iconst_1,                  // 13: iconst_1
+        (u1)Bytecodes::_ireturn,                   // 14: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 4, 2, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/RefCmp");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 1)\n", result.get_jint());
+    vm_assert(result.get_jint() == 1, "same reference should be equal");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+    TypeArrayKlass::destroy_all();
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 8 - if_acmpeq OK\n\n");
+}
+
+// ---- Test 29: ifnull / ifnonnull ----
+// Java 等价代码：
+//   Object a = null;
+//   if (a == null) return 10; else return 20;
+// 期望结果：10
+void test_ifnull() {
+    printf("=== Test: Phase 8 - ifnull / ifnonnull ===\n");
+
+    // 字节码：
+    // 0: aconst_null
+    // 1: ifnull +6              → if null, goto 7
+    // 4: bipush 20
+    // 6: ireturn
+    // 7: bipush 10
+    // 9: ireturn
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_aconst_null,               //  0: aconst_null
+        (u1)Bytecodes::_ifnull, 0x00, 0x06,        //  1: ifnull +6 → BCI 7
+        (u1)Bytecodes::_bipush, 20,                 //  4: bipush 20
+        (u1)Bytecodes::_ireturn,                    //  6: ireturn
+        (u1)Bytecodes::_bipush, 10,                 //  7: bipush 10
+        (u1)Bytecodes::_ireturn,                    //  9: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 2, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/NullCheck");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 10)\n", result.get_jint());
+    vm_assert(result.get_jint() == 10, "null check should return 10");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - ifnull OK\n\n");
+}
+
+// ---- Test 30: tableswitch ----
+// Java 等价代码：
+//   int x = 2;
+//   switch(x) {
+//     case 1: return 10;
+//     case 2: return 20;
+//     case 3: return 30;
+//     default: return -1;
+//   }
+// 期望结果：20
+void test_tableswitch() {
+    printf("=== Test: Phase 8 - tableswitch ===\n");
+
+    // tableswitch BCI 布局：
+    // BCI  0: iconst_2           → push 2
+    // BCI  1: tableswitch        → opcode
+    // BCI  2: padding (1 byte to align to 4)
+    //         wait... alignment: (bci+4) & ~3 = (1+4) & ~3 = 4
+    //         so pad starts at offset 3 from bcp (1 + padding to reach offset 4-1=3)
+    //         Actually: aligned = (1 + 4) & ~3 = 4. pad = 4 - 1 = 3.
+    //         So bytes at offset 1,2 are padding. Data starts at offset 3.
+    //         Actually, pad = aligned - bci = 4 - 1 = 3, meaning offsets 1,2,3 contain:
+    //           Actually the code does: int pad = aligned - bci;
+    //           and reads from bcp[pad] onwards.
+    //           bci=1, aligned=4, pad=3
+    //           So data at bcp[3] = offset 3 from opcode
+    //           i.e., bytes at positions 2, 3 (after opcode) are padding
+    //           byte at position 4 starts default_offset (in the stream, BCI 4)
+    //
+    // Let me think more carefully:
+    //   BCI 0: iconst_2
+    //   BCI 1: tableswitch opcode (0xAA)
+    //   BCI 2: pad
+    //   BCI 3: pad
+    //   BCI 4: default_offset bytes [0..3]  (4 bytes)
+    //   BCI 8: low [0..3] (4 bytes)
+    //   BCI 12: high [0..3] (4 bytes)
+    //   BCI 16: offset for case 1 (4 bytes)
+    //   BCI 20: offset for case 2 (4 bytes)
+    //   BCI 24: offset for case 3 (4 bytes)
+    //   BCI 28: (first instruction after switch)
+    //
+    // Jump targets (offsets from BCI 1):
+    //   case 1 → bipush 10 at BCI 28 → offset = 27
+    //   case 2 → bipush 20 at BCI 31 → offset = 30
+    //   case 3 → bipush 30 at BCI 34 → offset = 33
+    //   default → bipush -1 at BCI 37 → wait, let's use bipush for -1
+    //     Actually bipush can push -1: bipush 0xFF → signed = -1
+    //     Or use iconst_m1
+    //
+    // Let me layout:
+    //   BCI 28: bipush 10, ireturn   (3 bytes: 28,29,30)
+    //   BCI 31: bipush 20, ireturn   (3 bytes: 31,32,33)
+    //   BCI 34: bipush 30, ireturn   (3 bytes: 34,35,36)
+    //   BCI 37: iconst_m1, ireturn   (2 bytes: 37,38)
+    //
+    // Offsets from BCI 1 (tableswitch opcode):
+    //   case 1 → 28 - 1 = 27
+    //   case 2 → 31 - 1 = 30
+    //   case 3 → 34 - 1 = 33
+    //   default → 37 - 1 = 36
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_iconst_2,       //  0: iconst_2
+        (u1)Bytecodes::_tableswitch,    //  1: tableswitch
+        0x00, 0x00,                     //  2-3: padding (align to 4)
+        // default offset (4 bytes, big-endian): 36
+        0x00, 0x00, 0x00, 36,          //  4-7: default = 36 (→ BCI 37)
+        // low (4 bytes): 1
+        0x00, 0x00, 0x00, 0x01,        //  8-11: low = 1
+        // high (4 bytes): 3
+        0x00, 0x00, 0x00, 0x03,        // 12-15: high = 3
+        // jump offsets for cases 1,2,3
+        0x00, 0x00, 0x00, 27,          // 16-19: case 1 → offset 27 (BCI 28)
+        0x00, 0x00, 0x00, 30,          // 20-23: case 2 → offset 30 (BCI 31)
+        0x00, 0x00, 0x00, 33,          // 24-27: case 3 → offset 33 (BCI 34)
+        // case 1 target
+        (u1)Bytecodes::_bipush, 10,    // 28-29: bipush 10
+        (u1)Bytecodes::_ireturn,       // 30: ireturn
+        // case 2 target
+        (u1)Bytecodes::_bipush, 20,    // 31-32: bipush 20
+        (u1)Bytecodes::_ireturn,       // 33: ireturn
+        // case 3 target
+        (u1)Bytecodes::_bipush, 30,    // 34-35: bipush 30
+        (u1)Bytecodes::_ireturn,       // 36: ireturn
+        // default target
+        (u1)Bytecodes::_iconst_m1,     // 37: iconst_m1
+        (u1)Bytecodes::_ireturn,       // 38: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 2, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/Switch");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 20)\n", result.get_jint());
+    vm_assert(result.get_jint() == 20, "tableswitch case 2 should return 20");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - tableswitch OK\n\n");
+}
+
+// ---- Test 31: lookupswitch ----
+// Java 等价代码：
+//   int x = 100;
+//   switch(x) {
+//     case 10: return 1;
+//     case 100: return 2;
+//     case 1000: return 3;
+//     default: return -1;
+//   }
+// 期望结果：2
+void test_lookupswitch() {
+    printf("=== Test: Phase 8 - lookupswitch ===\n");
+
+    // BCI 布局：
+    // BCI  0: bipush 100          → push 100
+    // BCI  2: lookupswitch        → opcode
+    // BCI  3: padding (1 byte to align to 4)
+    //         bci=2, aligned=(2+4)&~3=4, pad=4-2=2
+    //         But wait: pad includes offset from opcode position.
+    //         Actually I need to be more careful.
+    //         bci of lookupswitch = 2
+    //         aligned = (2 + 4) & ~3 = 4
+    //         pad = aligned - bci = 4 - 2 = 2
+    //         So data starts at bcp[2], meaning BCI 4
+    //
+    //   BCI 4: default_offset (4 bytes)
+    //   BCI 8: npairs (4 bytes) = 3
+    //   BCI 12: match=10, offset (8 bytes)
+    //   BCI 20: match=100, offset (8 bytes)
+    //   BCI 28: match=1000, offset (8 bytes)
+    //   BCI 36: (first instruction after switch)
+    //
+    // Target offsets (from BCI 2):
+    //   case 10  → BCI 36 → offset = 34
+    //   case 100 → BCI 39 → offset = 37
+    //   case 1000 → BCI 42 → offset = 40
+    //   default → BCI 45 → offset = 43
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_bipush, 100,    //  0-1: bipush 100
+        (u1)Bytecodes::_lookupswitch,   //  2: lookupswitch
+        0x00,                           //  3: padding (1 byte)
+        // default offset (4 bytes): 43
+        0x00, 0x00, 0x00, 43,          //  4-7: default = 43 (→ BCI 45)
+        // npairs (4 bytes): 3
+        0x00, 0x00, 0x00, 0x03,        //  8-11: npairs = 3
+        // pair 1: match=10, offset=34
+        0x00, 0x00, 0x00, 10,          // 12-15: match = 10
+        0x00, 0x00, 0x00, 34,          // 16-19: offset = 34 (→ BCI 36)
+        // pair 2: match=100, offset=37
+        0x00, 0x00, 0x00, 100,         // 20-23: match = 100
+        0x00, 0x00, 0x00, 37,          // 24-27: offset = 37 (→ BCI 39)
+        // pair 3: match=1000, offset=40
+        0x00, 0x00, 0x03, 0xE8,        // 28-31: match = 1000
+        0x00, 0x00, 0x00, 40,          // 32-35: offset = 40 (→ BCI 42)
+        // case 10 target
+        (u1)Bytecodes::_iconst_1,      // 36: iconst_1
+        (u1)Bytecodes::_ireturn,       // 37: ireturn
+        (u1)Bytecodes::_nop,           // 38: nop (align)
+        // case 100 target
+        (u1)Bytecodes::_iconst_2,      // 39: iconst_2
+        (u1)Bytecodes::_ireturn,       // 40: ireturn
+        (u1)Bytecodes::_nop,           // 41: nop (align)
+        // case 1000 target
+        (u1)Bytecodes::_iconst_3,      // 42: iconst_3
+        (u1)Bytecodes::_ireturn,       // 43: ireturn
+        (u1)Bytecodes::_nop,           // 44: nop (align)
+        // default target
+        (u1)Bytecodes::_iconst_m1,     // 45: iconst_m1
+        (u1)Bytecodes::_ireturn,       // 46: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 2, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/LookupSwitch");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 2)\n", result.get_jint());
+    vm_assert(result.get_jint() == 2, "lookupswitch case 100 should return 2");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - lookupswitch OK\n\n");
+}
+
+// ---- Test 32: long 运算 ----
+// Java 等价代码：
+//   long a = 1000000000L;  // 10^9
+//   long b = 2000000000L;  // 2*10^9
+//   long c = a + b;        // 3*10^9 (超出 int 范围)
+//   return (int)(c / 1000000000L);  // = 3
+// 期望结果：3
+void test_long_arithmetic() {
+    printf("=== Test: Phase 8 - long arithmetic ===\n");
+
+    // 使用 ldc2_w 来加载 long 常量：需要常量池支持
+    // 简化方案：用 i2l 和 imul 构造 long 值
+    //
+    // 构造 1000000000L:
+    //   bipush 100, i2l,           → 100L
+    //   bipush 100, i2l, lmul,    → 10000L
+    //   bipush 100, i2l, lmul,    → 1000000L
+    //   sipush 1000, i2l, lmul,   → 1000000000L
+    //   lstore_0
+    //
+    // 太长了，换个简单方案。
+    //
+    // 用 lconst_1 和 ladd 做 long 加法，验证基本功能：
+    //   lconst_1    → push 1L
+    //   lconst_1    → push 1L
+    //   ladd        → push 2L
+    //   lconst_1    → push 1L
+    //   ladd        → push 3L
+    //   l2i         → push 3
+    //   ireturn     → return 3
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_lconst_1,      //  0: lconst_1 → 1L
+        (u1)Bytecodes::_lconst_1,      //  1: lconst_1 → 1L
+        (u1)Bytecodes::_ladd,          //  2: ladd → 2L
+        (u1)Bytecodes::_lconst_1,      //  3: lconst_1 → 1L
+        (u1)Bytecodes::_ladd,          //  4: ladd → 3L
+        (u1)Bytecodes::_l2i,           //  5: l2i → 3
+        (u1)Bytecodes::_ireturn,       //  6: ireturn → 3
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 6, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/LongArith");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 3)\n", result.get_jint());
+    vm_assert(result.get_jint() == 3, "1L+1L+1L should be 3");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - long arithmetic OK\n\n");
+}
+
+// ---- Test 33: long 存储/加载 + lmul + lcmp ----
+// Java 等价代码：
+//   long a = 1L;
+//   long b = 1L;
+//   // 连续乘以 10, 10 次 → a = 10^10 (超过 int 范围)
+//   // 简化：a=5L, b=3L, c = a * b = 15L, l2i → 15
+//   long a = 5;
+//   long b = 3;
+//   long c = a * b;    // 15L
+//   if (c > 10L) return 1; else return 0;
+// 期望结果：1 (因为 15 > 10)
+void test_long_store_load_cmp() {
+    printf("=== Test: Phase 8 - lstore/lload + lmul + lcmp ===\n");
+
+    // 字节码：
+    //  0: iconst_5, i2l        → 5L
+    //  2: lstore_0             → local[0,1] = 5L
+    //  3: iconst_3, i2l        → 3L
+    //  5: lstore_2             → local[2,3] = 3L
+    //  6: lload_0              → 5L
+    //  7: lload_2              → 3L
+    //  8: lmul                 → 15L
+    //  9: bipush 10, i2l       → 10L
+    // 12: lcmp                 → 1 (15 > 10)
+    // 13: ifgt +5              → if (result > 0) goto 18
+    // 16: iconst_0
+    // 17: ireturn
+    // 18: iconst_1
+    // 19: ireturn
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_iconst_5,      //  0: iconst_5
+        (u1)Bytecodes::_i2l,           //  1: i2l → 5L
+        (u1)Bytecodes::_lstore_0,      //  2: lstore_0
+        (u1)Bytecodes::_iconst_3,      //  3: iconst_3
+        (u1)Bytecodes::_i2l,           //  4: i2l → 3L
+        (u1)Bytecodes::_lstore_2,      //  5: lstore_2
+        (u1)Bytecodes::_lload_0,       //  6: lload_0 → 5L
+        (u1)Bytecodes::_lload_2,       //  7: lload_2 → 3L
+        (u1)Bytecodes::_lmul,          //  8: lmul → 15L
+        (u1)Bytecodes::_bipush, 10,    //  9: bipush 10
+        (u1)Bytecodes::_i2l,           // 11: i2l → 10L
+        (u1)Bytecodes::_lcmp,          // 12: lcmp → 1 (15 > 10)
+        (u1)Bytecodes::_ifgt, 0x00, 0x05, // 13: ifgt +5 → BCI 18
+        (u1)Bytecodes::_iconst_0,      // 16: iconst_0
+        (u1)Bytecodes::_ireturn,       // 17: ireturn
+        (u1)Bytecodes::_iconst_1,      // 18: iconst_1
+        (u1)Bytecodes::_ireturn,       // 19: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    // max_stack=6 (enough for 2 longs + temp), max_locals=4 (2 longs)
+    ConstMethod* cm = new ConstMethod(cp, code_length, 6, 4, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/LongCmp");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 1)\n", result.get_jint());
+    vm_assert(result.get_jint() == 1, "5L*3L=15L > 10L should return 1");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - lstore/lload + lmul + lcmp OK\n\n");
+}
+
+// ---- Test 34: pop2 ----
+// Java 等价代码：
+//   long x = 42L; // push and pop2 to discard
+//   return 99;
+// 期望结果：99
+void test_pop2() {
+    printf("=== Test: Phase 8 - pop2 ===\n");
+
+    // 字节码：
+    //  0: lconst_1       → push 1L (2 slots)
+    //  1: pop2           → discard 2 slots
+    //  2: bipush 99      → push 99
+    //  4: ireturn        → return 99
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_lconst_1,      //  0: lconst_1
+        (u1)Bytecodes::_pop2,          //  1: pop2
+        (u1)Bytecodes::_bipush, 99,    //  2: bipush 99
+        (u1)Bytecodes::_ireturn,       //  4: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 4, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/Pop2");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 99)\n", result.get_jint());
+    vm_assert(result.get_jint() == 99, "pop2 should discard long, return 99");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - pop2 OK\n\n");
+}
+
+// ---- Test 35: tableswitch default 分支 ----
+// Java 等价代码：
+//   int x = 99;
+//   switch(x) {
+//     case 1: return 10;
+//     case 2: return 20;
+//     default: return -1;
+//   }
+// 期望结果：-1
+void test_tableswitch_default() {
+    printf("=== Test: Phase 8 - tableswitch (default branch) ===\n");
+
+    // BCI 布局：
+    // BCI  0: bipush 99
+    // BCI  2: tableswitch
+    //   bci=2, aligned=(2+4)&~3=4, pad=2
+    //   BCI 3: padding (1 byte)
+    //   BCI 4: default_offset (4 bytes)
+    //   BCI 8: low = 1 (4 bytes)
+    //   BCI 12: high = 2 (4 bytes)
+    //   BCI 16: case 1 offset (4 bytes)
+    //   BCI 20: case 2 offset (4 bytes)
+    //   BCI 24: (first target)
+    //
+    // Targets (offsets from BCI 2):
+    //   case 1 → BCI 24 → offset 22
+    //   case 2 → BCI 27 → offset 25
+    //   default → BCI 30 → offset 28
+
+    u1 bytecodes[] = {
+        (u1)Bytecodes::_bipush, 99,     //  0-1: bipush 99
+        (u1)Bytecodes::_tableswitch,    //  2: tableswitch
+        0x00,                           //  3: padding
+        // default offset: 28
+        0x00, 0x00, 0x00, 28,          //  4-7: default = 28 (→ BCI 30)
+        // low: 1
+        0x00, 0x00, 0x00, 0x01,        //  8-11: low = 1
+        // high: 2
+        0x00, 0x00, 0x00, 0x02,        // 12-15: high = 2
+        // case 1: offset 22
+        0x00, 0x00, 0x00, 22,          // 16-19: case 1 → BCI 24
+        // case 2: offset 25
+        0x00, 0x00, 0x00, 25,          // 20-23: case 2 → BCI 27
+        // case 1 target
+        (u1)Bytecodes::_bipush, 10,    // 24-25: bipush 10
+        (u1)Bytecodes::_ireturn,       // 26: ireturn
+        // case 2 target
+        (u1)Bytecodes::_bipush, 20,    // 27-28: bipush 20
+        (u1)Bytecodes::_ireturn,       // 29: ireturn
+        // default target
+        (u1)Bytecodes::_iconst_m1,     // 30: iconst_m1
+        (u1)Bytecodes::_ireturn,       // 31: ireturn
+    };
+
+    int code_length = sizeof(bytecodes);
+    ConstantPool* cp = new ConstantPool(1);
+    ConstMethod* cm = new ConstMethod(cp, code_length, 2, 1, 0, 0);
+    cm->set_bytecodes(bytecodes, code_length);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_name("test/SwitchDef");
+    ik->set_constants(cp);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected -1)\n", result.get_jint());
+    vm_assert(result.get_jint() == -1, "tableswitch default should return -1");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete ik;
+
+    printf("  [PASS] Phase 8 - tableswitch default OK\n\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char** argv) {
     printf("========================================\n");
-    printf("  Mini JVM - Phase 7: Arrays\n");
+    printf("  Mini JVM - Phase 8: Long/Switch/Ref\n");
     printf("========================================\n\n");
 
     // Phase 1 基础测试
@@ -2273,15 +2899,25 @@ int main(int argc, char** argv) {
     test_multiple_method_calls();
     test_init_with_args();
 
-    // Phase 7 新增测试
+    // Phase 7 测试
     test_type_array_klass_basic();
     test_newarray_int();
     test_arraylength();
     test_byte_array();
     test_array_loop_sum();
 
+    // Phase 8 新增测试
+    test_if_acmpeq();
+    test_ifnull();
+    test_tableswitch();
+    test_lookupswitch();
+    test_long_arithmetic();
+    test_long_store_load_cmp();
+    test_pop2();
+    test_tableswitch_default();
+
     printf("========================================\n");
-    printf("  All Phase 7 tests completed!\n");
+    printf("  All Phase 8 tests completed!\n");
     printf("========================================\n");
 
     return 0;

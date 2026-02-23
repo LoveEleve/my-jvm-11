@@ -346,7 +346,11 @@ public:
             case _if_icmpge:    return "if_icmpge";
             case _if_icmpgt:    return "if_icmpgt";
             case _if_icmple:    return "if_icmple";
+            case _if_acmpeq:    return "if_acmpeq";
+            case _if_acmpne:    return "if_acmpne";
             case _goto:         return "goto";
+            case _tableswitch:  return "tableswitch";
+            case _lookupswitch: return "lookupswitch";
             case _ireturn:      return "ireturn";
             case _lreturn:      return "lreturn";
             case _freturn:      return "freturn";
@@ -374,6 +378,30 @@ public:
             case _athrow:       return "athrow";
             case _checkcast:    return "checkcast";
             case _instanceof:   return "instanceof";
+            case _ifnull:       return "ifnull";
+            case _ifnonnull:    return "ifnonnull";
+            case _lconst_0:     return "lconst_0";
+            case _lconst_1:     return "lconst_1";
+            case _lload:        return "lload";
+            case _lload_0:      return "lload_0";
+            case _lload_1:      return "lload_1";
+            case _lload_2:      return "lload_2";
+            case _lload_3:      return "lload_3";
+            case _lstore:       return "lstore";
+            case _lstore_0:     return "lstore_0";
+            case _lstore_1:     return "lstore_1";
+            case _lstore_2:     return "lstore_2";
+            case _lstore_3:     return "lstore_3";
+            case _ladd:         return "ladd";
+            case _lsub:         return "lsub";
+            case _lmul:         return "lmul";
+            case _ldiv:         return "ldiv";
+            case _lrem:         return "lrem";
+            case _lneg:         return "lneg";
+            case _lcmp:         return "lcmp";
+            case _l2i:          return "l2i";
+            case _pop2:         return "pop2";
+            case _dup_x1:       return "dup_x1";
             default:            return "unknown";
         }
     }

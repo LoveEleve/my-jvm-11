@@ -121,6 +121,14 @@ public:
         return (jshort)(((int)_bcp[offset] << 8) | (int)_bcp[offset + 1]);
     }
 
+    // 读取 4 字节有符号操作数（大端，tableswitch/lookupswitch 需要）
+    jint read_s4_operand(int offset) const {
+        return (jint)(((u4)_bcp[offset]     << 24) |
+                      ((u4)_bcp[offset + 1] << 16) |
+                      ((u4)_bcp[offset + 2] <<  8) |
+                      ((u4)_bcp[offset + 3]));
+    }
+
     // 推进 BCP
     void advance_bcp(int delta) { _bcp += delta; }
 

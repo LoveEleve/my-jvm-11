@@ -133,6 +133,16 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
             frame->advance_bcp(1);
             break;
 
+        // Long 常量（Phase 8）
+        case Bytecodes::_lconst_0:
+            frame->push_long((jlong)0);
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lconst_1:
+            frame->push_long((jlong)1);
+            frame->advance_bcp(1);
+            break;
+
         case Bytecodes::_bipush: {
             jbyte value = (jbyte)frame->read_u1_operand(1);
             frame->push_int((jint)value);
@@ -217,6 +227,30 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
             frame->advance_bcp(1);
             break;
 
+        // Long 加载（Phase 8）
+        case Bytecodes::_lload: {
+            int index = frame->read_u1_operand(1);
+            frame->push_long(frame->local_long(index));
+            frame->advance_bcp(2);
+            break;
+        }
+        case Bytecodes::_lload_0:
+            frame->push_long(frame->local_long(0));
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lload_1:
+            frame->push_long(frame->local_long(1));
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lload_2:
+            frame->push_long(frame->local_long(2));
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lload_3:
+            frame->push_long(frame->local_long(3));
+            frame->advance_bcp(1);
+            break;
+
         // ================================================================
         // 局部变量存储
         // ================================================================
@@ -269,11 +303,41 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
             frame->advance_bcp(1);
             break;
 
+        // Long 存储（Phase 8）
+        case Bytecodes::_lstore: {
+            int index = frame->read_u1_operand(1);
+            frame->set_local_long(index, frame->pop_long());
+            frame->advance_bcp(2);
+            break;
+        }
+        case Bytecodes::_lstore_0:
+            frame->set_local_long(0, frame->pop_long());
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lstore_1:
+            frame->set_local_long(1, frame->pop_long());
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lstore_2:
+            frame->set_local_long(2, frame->pop_long());
+            frame->advance_bcp(1);
+            break;
+        case Bytecodes::_lstore_3:
+            frame->set_local_long(3, frame->pop_long());
+            frame->advance_bcp(1);
+            break;
+
         // ================================================================
         // 栈操作
         // ================================================================
 
         case Bytecodes::_pop:
+            frame->pop_raw();
+            frame->advance_bcp(1);
+            break;
+
+        case Bytecodes::_pop2:
+            frame->pop_raw();
             frame->pop_raw();
             frame->advance_bcp(1);
             break;
@@ -359,6 +423,79 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
         case Bytecodes::_ineg: {
             jint v = frame->pop_int();
             frame->push_int(-v);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        // ================================================================
+        // Long 算术（Phase 8）
+        // ================================================================
+
+        case Bytecodes::_ladd: {
+            jlong v2 = frame->pop_long();
+            jlong v1 = frame->pop_long();
+            frame->push_long(v1 + v2);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_lsub: {
+            jlong v2 = frame->pop_long();
+            jlong v1 = frame->pop_long();
+            frame->push_long(v1 - v2);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_lmul: {
+            jlong v2 = frame->pop_long();
+            jlong v1 = frame->pop_long();
+            frame->push_long(v1 * v2);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_ldiv: {
+            jlong v2 = frame->pop_long();
+            jlong v1 = frame->pop_long();
+            if (v2 == 0) {
+                thread->set_pending_exception(nullptr, "java.lang.ArithmeticException: / by zero");
+                return;
+            }
+            frame->push_long(v1 / v2);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_lrem: {
+            jlong v2 = frame->pop_long();
+            jlong v1 = frame->pop_long();
+            if (v2 == 0) {
+                thread->set_pending_exception(nullptr, "java.lang.ArithmeticException: / by zero");
+                return;
+            }
+            frame->push_long(v1 % v2);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        case Bytecodes::_lneg: {
+            jlong v = frame->pop_long();
+            frame->push_long(-v);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        // ================================================================
+        // Long 比较（Phase 8）
+        // ================================================================
+
+        case Bytecodes::_lcmp: {
+            jlong v2 = frame->pop_long();
+            jlong v1 = frame->pop_long();
+            if (v1 > v2) frame->push_int(1);
+            else if (v1 == v2) frame->push_int(0);
+            else frame->push_int(-1);
             frame->advance_bcp(1);
             break;
         }
@@ -456,6 +593,14 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
         case Bytecodes::_i2s: {
             jint v = frame->pop_int();
             frame->push_int((jint)(jshort)v);
+            frame->advance_bcp(1);
+            break;
+        }
+
+        // Long → Int 转换（Phase 8）
+        case Bytecodes::_l2i: {
+            jlong v = frame->pop_long();
+            frame->push_int((jint)v);
             frame->advance_bcp(1);
             break;
         }
@@ -607,12 +752,126 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
         }
 
         // ================================================================
+        // 条件跳转（引用比较）— Phase 8
+        // ================================================================
+
+        case Bytecodes::_if_acmpeq: {
+            oopDesc* v2 = frame->pop_oop();
+            oopDesc* v1 = frame->pop_oop();
+            if (v1 == v2) {
+                int offset = frame->read_s2_operand(1);
+                frame->advance_bcp(offset);
+            } else {
+                frame->advance_bcp(3);
+            }
+            break;
+        }
+
+        case Bytecodes::_if_acmpne: {
+            oopDesc* v2 = frame->pop_oop();
+            oopDesc* v1 = frame->pop_oop();
+            if (v1 != v2) {
+                int offset = frame->read_s2_operand(1);
+                frame->advance_bcp(offset);
+            } else {
+                frame->advance_bcp(3);
+            }
+            break;
+        }
+
+        case Bytecodes::_ifnull: {
+            oopDesc* v = frame->pop_oop();
+            if (v == nullptr) {
+                int offset = frame->read_s2_operand(1);
+                frame->advance_bcp(offset);
+            } else {
+                frame->advance_bcp(3);
+            }
+            break;
+        }
+
+        case Bytecodes::_ifnonnull: {
+            oopDesc* v = frame->pop_oop();
+            if (v != nullptr) {
+                int offset = frame->read_s2_operand(1);
+                frame->advance_bcp(offset);
+            } else {
+                frame->advance_bcp(3);
+            }
+            break;
+        }
+
+        // ================================================================
         // 无条件跳转
         // ================================================================
 
         case Bytecodes::_goto: {
             int offset = frame->read_s2_operand(1);
             frame->advance_bcp(offset);
+            break;
+        }
+
+        // ================================================================
+        // Switch 跳转 — Phase 8
+        // ================================================================
+
+        case Bytecodes::_tableswitch: {
+            // tableswitch 格式:
+            //   opcode (1 byte)
+            //   padding (0-3 bytes to align to 4-byte boundary)
+            //   default offset (4 bytes, signed)
+            //   low (4 bytes, signed)
+            //   high (4 bytes, signed)
+            //   jump offsets (high-low+1 entries, each 4 bytes signed)
+            int bci = frame->bci();
+            int aligned = (bci + 4) & ~3;  // 对齐到 4 字节边界
+            int pad = aligned - bci;        // padding 字节数（含 opcode）
+
+            jint default_offset = frame->read_s4_operand(pad);
+            jint low  = frame->read_s4_operand(pad + 4);
+            jint high = frame->read_s4_operand(pad + 8);
+
+            jint index = frame->pop_int();
+
+            if (index >= low && index <= high) {
+                int entry_offset = pad + 12 + (index - low) * 4;
+                jint jump = frame->read_s4_operand(entry_offset);
+                frame->advance_bcp(jump);
+            } else {
+                frame->advance_bcp(default_offset);
+            }
+            break;
+        }
+
+        case Bytecodes::_lookupswitch: {
+            // lookupswitch 格式:
+            //   opcode (1 byte)
+            //   padding (0-3 bytes to align to 4-byte boundary)
+            //   default offset (4 bytes, signed)
+            //   npairs (4 bytes, signed)
+            //   match-offset pairs (npairs * 8 bytes)
+            int bci = frame->bci();
+            int aligned = (bci + 4) & ~3;
+            int pad = aligned - bci;
+
+            jint default_offset = frame->read_s4_operand(pad);
+            jint npairs = frame->read_s4_operand(pad + 4);
+
+            jint key = frame->pop_int();
+
+            bool found = false;
+            for (jint i = 0; i < npairs; i++) {
+                jint match  = frame->read_s4_operand(pad + 8 + i * 8);
+                jint offset = frame->read_s4_operand(pad + 8 + i * 8 + 4);
+                if (key == match) {
+                    frame->advance_bcp(offset);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                frame->advance_bcp(default_offset);
+            }
             break;
         }
 

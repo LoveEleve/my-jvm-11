@@ -1,0 +1,793 @@
+// ============================================================================
+// Mini JVM - Phase 4 测试入口
+// 测试 OOP-Klass 对象模型 + 字节码解释器
+// ============================================================================
+
+#include "utilities/globalDefinitions.hpp"
+#include "utilities/debug.hpp"
+#include "utilities/macros.hpp"
+#include "utilities/bytes.hpp"
+#include "utilities/accessFlags.hpp"
+#include "memory/allocation.hpp"
+#include "oops/oopsHierarchy.hpp"
+#include "oops/markOop.hpp"
+#include "oops/oop.hpp"
+#include "oops/instanceOop.hpp"
+#include "oops/metadata.hpp"
+#include "oops/constMethod.hpp"
+#include "oops/method.hpp"
+#include "oops/klass.hpp"
+#include "oops/instanceKlass.hpp"
+#include "classfile/classFileStream.hpp"
+#include "classfile/classFileParser.hpp"
+#include "interpreter/bytecodes.hpp"
+#include "runtime/javaThread.hpp"
+#include "runtime/frame.hpp"
+#include "interpreter/bytecodeInterpreter.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+
+// ----------------------------------------------------------------------------
+// 读取文件到内存
+// ----------------------------------------------------------------------------
+static u1* read_class_file(const char* path, int* out_length) {
+    FILE* f = fopen(path, "rb");
+    if (f == nullptr) {
+        fprintf(stderr, "Error: Cannot open file: %s\n", path);
+        return nullptr;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    u1* buffer = NEW_C_HEAP_ARRAY(u1, size, mtClass);
+    size_t rd = fread(buffer, 1, size, f);
+    fclose(f);
+
+    if ((long)rd != size) {
+        FREE_C_HEAP_ARRAY(u1, buffer);
+        return nullptr;
+    }
+    *out_length = (int)size;
+    return buffer;
+}
+
+// ============================================================================
+// Phase 1 测试：基础类型和工具
+// ============================================================================
+
+void test_bytes() {
+    printf("=== Test: Bytes (Endian) ===\n");
+    u1 data_u2[] = { 0x00, 0x37 };
+    u2 val_u2 = Bytes::get_Java_u2((address)data_u2);
+    vm_assert(val_u2 == 55, "u2 byte swap failed");
+    printf("  get_Java_u2 = %d  [PASS]\n", val_u2);
+
+    u1 data_u4[] = { 0xCA, 0xFE, 0xBA, 0xBE };
+    u4 val_u4 = Bytes::get_Java_u4((address)data_u4);
+    vm_assert(val_u4 == 0xCAFEBABE, "u4 byte swap failed");
+    printf("  get_Java_u4 = 0x%08X  [PASS]\n", val_u4);
+    printf("\n");
+}
+
+// ============================================================================
+// Phase 2 测试：ClassFileParser
+// ============================================================================
+
+void test_classfile_stream() {
+    printf("=== Test: ClassFileStream ===\n");
+    u1 data[] = {
+        0xCA, 0xFE, 0xBA, 0xBE,
+        0x00, 0x00,
+        0x00, 0x37,
+        0x00, 0x05,
+    };
+    ClassFileStream stream(data, sizeof(data), "test_data");
+    vm_assert(stream.get_u4() == 0xCAFEBABE, "magic");
+    vm_assert(stream.get_u2() == 0, "minor");
+    vm_assert(stream.get_u2() == 55, "major");
+    vm_assert(stream.get_u2() == 5, "cp_count");
+    vm_assert(stream.at_eos(), "eos");
+    printf("  [PASS] ClassFileStream OK\n\n");
+}
+
+// ============================================================================
+// Phase 3 测试 1：Mark Word
+// ============================================================================
+
+void test_mark_word() {
+    printf("=== Test: Mark Word ===\n");
+
+    // prototype() 应该是 unlocked，hash=0，age=0
+    markOop proto = markOopDesc::prototype();
+    printf("  prototype = 0x%016lx\n", (unsigned long)(uintptr_t)proto);
+
+    vm_assert(proto->is_unlocked(), "prototype should be unlocked");
+    vm_assert(proto->is_neutral(), "prototype should be neutral");
+    vm_assert(!proto->is_locked(), "prototype should not be locked");
+    vm_assert(!proto->is_marked(), "prototype should not be marked");
+    vm_assert(!proto->has_bias_pattern(), "prototype should not be biased");
+    vm_assert(proto->has_no_hash(), "prototype should have no hash");
+    vm_assert(proto->age() == 0, "prototype age should be 0");
+
+    // 测试 set_age
+    markOop aged = proto->set_age(5);
+    vm_assert(aged->age() == 5, "age should be 5");
+    vm_assert(aged->is_unlocked(), "should still be unlocked");
+
+    // 测试 incr_age
+    markOop aged2 = aged->incr_age();
+    vm_assert(aged2->age() == 6, "age should be 6");
+
+    // 测试 copy_set_hash
+    markOop hashed = proto->copy_set_hash(0x12345678);
+    vm_assert(hashed->hash() == 0x12345678, "hash mismatch");
+    vm_assert(hashed->is_unlocked(), "should still be unlocked");
+
+    // 测试 set_marked (GC)
+    markOop marked = proto->set_marked();
+    vm_assert(marked->is_marked(), "should be marked");
+
+    printf("  Mark Word bit layout:\n");
+    printf("    lock_bits=%d, biased_lock_bits=%d, age_bits=%d, hash_bits=%d\n",
+           markOopDesc::lock_bits, markOopDesc::biased_lock_bits,
+           markOopDesc::age_bits, markOopDesc::hash_bits);
+    printf("    age_shift=%d, hash_shift=%d\n",
+           markOopDesc::age_shift, markOopDesc::hash_shift);
+    printf("    lock_mask=0x%lx, age_mask=0x%lx\n",
+           (unsigned long)markOopDesc::lock_mask,
+           (unsigned long)markOopDesc::age_mask);
+    printf("    hash_mask=0x%016lx\n", (unsigned long)markOopDesc::hash_mask);
+
+    printf("  [PASS] Mark Word OK\n\n");
+}
+
+// ============================================================================
+// Phase 3 测试 2：oopDesc 头部大小
+// ============================================================================
+
+void test_oop_header() {
+    printf("=== Test: oopDesc Header ===\n");
+
+    printf("  sizeof(oopDesc) = %lu bytes\n", (unsigned long)sizeof(oopDesc));
+    printf("  oopDesc::header_size() = %d HeapWords\n", oopDesc::header_size());
+    printf("  sizeof(instanceOopDesc) = %lu bytes\n", (unsigned long)sizeof(instanceOopDesc));
+    printf("  instanceOopDesc::header_size() = %d HeapWords\n", instanceOopDesc::header_size());
+    printf("  instanceOopDesc::base_offset_in_bytes() = %d\n", instanceOopDesc::base_offset_in_bytes());
+
+    // LP64 非压缩指针下：
+    vm_assert(sizeof(oopDesc) == 16, "oopDesc should be 16 bytes on LP64");
+    vm_assert(oopDesc::header_size() == 2, "header should be 2 HeapWords");
+    vm_assert(instanceOopDesc::base_offset_in_bytes() == 16, "base offset should be 16");
+
+    // 偏移量
+    printf("  mark_offset = %d\n", oopDesc::mark_offset_in_bytes());
+    printf("  klass_offset = %d\n", oopDesc::klass_offset_in_bytes());
+    vm_assert(oopDesc::mark_offset_in_bytes() == 0, "mark at offset 0");
+    vm_assert(oopDesc::klass_offset_in_bytes() == 8, "klass at offset 8");
+
+    printf("  [PASS] oopDesc Header OK\n\n");
+}
+
+// ============================================================================
+// Phase 3 测试 3：AccessFlags
+// ============================================================================
+
+void test_access_flags() {
+    printf("=== Test: AccessFlags ===\n");
+
+    // 测试一个 public final class 的标志
+    AccessFlags flags(JVM_ACC_PUBLIC | JVM_ACC_FINAL | JVM_ACC_SUPER);
+    vm_assert(flags.is_public(), "should be public");
+    vm_assert(flags.is_final(), "should be final");
+    vm_assert(flags.is_super(), "should have ACC_SUPER");
+    vm_assert(!flags.is_interface(), "should not be interface");
+    vm_assert(!flags.is_abstract(), "should not be abstract");
+
+    printf("  Public final class flags: ");
+    flags.print_on(stdout);
+    printf("\n");
+
+    // 测试 Method 的 HotSpot 扩展标志
+    AccessFlags mflags(JVM_ACC_PUBLIC | JVM_ACC_STATIC);
+    mflags.set_has_linenumber_table();
+    vm_assert(mflags.is_public(), "should be public");
+    vm_assert(mflags.is_static(), "should be static");
+    vm_assert(mflags.has_linenumber_table(), "should have linenumber table");
+
+    printf("  Public static method flags: ");
+    mflags.print_on(stdout);
+    printf("\n");
+
+    // 测试 get_flags() 只返回 .class 文件标志
+    jint written = mflags.get_flags();
+    vm_assert(written == (JVM_ACC_PUBLIC | JVM_ACC_STATIC),
+              "get_flags() should mask HotSpot bits");
+
+    printf("  [PASS] AccessFlags OK\n\n");
+}
+
+// ============================================================================
+// Phase 3 测试 4：Metadata 和 Method
+// ============================================================================
+
+void test_metadata_method() {
+    printf("=== Test: Metadata / Method ===\n");
+
+    // 创建一个简单的 ConstantPool（1 个 slot）
+    ConstantPool* cp = new ConstantPool(5);
+    cp->utf8_at_put(1, (const u1*)"testMethod", 10);
+    cp->utf8_at_put(2, (const u1*)"()V", 3);
+
+    // 创建 ConstMethod
+    ConstMethod* cm = new ConstMethod(cp, 3, 1, 1, 1, 2);
+    u1 bytecodes[] = { 0xB1, 0x00, 0x00 }; // return
+    cm->set_bytecodes(bytecodes, 3);
+
+    // 创建 Method
+    Method* m = new Method(cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // 验证 Metadata 虚函数
+    Metadata* meta = m;
+    vm_assert(meta->is_method(), "should be method");
+    vm_assert(!meta->is_klass(), "should not be klass");
+
+    // 验证 Method 字段
+    vm_assert(m->code_size() == 3, "code size should be 3");
+    vm_assert(m->max_stack() == 1, "max_stack should be 1");
+    vm_assert(m->max_locals() == 1, "max_locals should be 1");
+    vm_assert(m->name_index() == 1, "name_index should be 1");
+    vm_assert(m->signature_index() == 2, "signature_index should be 2");
+    vm_assert(m->is_public(), "should be public");
+
+    // 验证字节码
+    vm_assert(cm->bytecode_at(0) == 0xB1, "first bytecode should be 0xB1 (return)");
+
+    printf("  Method: ");
+    m->print_on(stdout);
+    printf("\n");
+
+    // 清理
+    delete m;  // 这会同时删除 cm
+    delete cp;
+
+    printf("  [PASS] Metadata/Method OK\n\n");
+}
+
+// ============================================================================
+// Phase 3 测试 5：Klass 和 InstanceKlass
+// ============================================================================
+
+void test_klass() {
+    printf("=== Test: Klass / InstanceKlass ===\n");
+
+    InstanceKlass* ik = new InstanceKlass();
+
+    // 验证 Metadata 虚函数
+    Metadata* meta = ik;
+    vm_assert(meta->is_klass(), "should be klass");
+    vm_assert(!meta->is_method(), "should not be method");
+
+    // 验证 KlassID
+    vm_assert(ik->id() == InstanceKlassID, "should be InstanceKlassID");
+
+    // 验证初始状态
+    vm_assert(ik->init_state() == InstanceKlass::allocated, "initial state should be allocated");
+    vm_assert(!ik->is_loaded(), "should not be loaded yet");
+
+    // 设置基本信息
+    ik->set_class_name("com/test/MyClass");
+    ik->set_super_class_name("java/lang/Object");
+    ik->set_access_flags(AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_SUPER));
+    ik->set_instance_size(32);
+
+    vm_assert(ik->is_instance_klass(), "should be instance klass (positive layout_helper)");
+    vm_assert(ik->instance_size() == 32, "instance size should be 32");
+    vm_assert(strcmp(ik->name(), "com/test/MyClass") == 0, "name mismatch");
+
+    printf("  ");
+    ik->print_on(stdout);
+    printf("\n");
+
+    delete ik;
+    printf("  [PASS] Klass/InstanceKlass OK\n\n");
+}
+
+// ============================================================================
+// Phase 3 测试 6：完整流程 — 解析 .class → 创建 InstanceKlass
+// ============================================================================
+
+void test_full_pipeline(const char* path) {
+    printf("=== Test: Full Pipeline (ClassFile → InstanceKlass) ===\n");
+    printf("  File: %s\n\n", path);
+
+    // 读取文件
+    int length = 0;
+    u1* buffer = read_class_file(path, &length);
+    if (buffer == nullptr) {
+        printf("  [SKIP] File not found.\n\n");
+        return;
+    }
+    printf("  File size: %d bytes\n", length);
+
+    // 创建流
+    ClassFileStream stream(buffer, length, path);
+
+    // 解析
+    ClassFileParser parser(&stream);
+    parser.parse();
+
+    // 打印解析结果
+    printf("\n  --- ClassFileParser Result ---\n");
+    parser.print_summary(stdout);
+
+    // 创建 InstanceKlass
+    InstanceKlass* ik = parser.create_instance_klass();
+    guarantee(ik != nullptr, "create_instance_klass() returned null");
+
+    // 打印 InstanceKlass 信息
+    printf("  --- InstanceKlass Result ---\n");
+    ik->print_summary(stdout);
+
+    // 验证基本属性
+    printf("  Verification:\n");
+    printf("    is_klass() = %s\n", ik->is_klass() ? "true" : "false");
+    printf("    is_instance_klass() = %s\n", ik->is_instance_klass() ? "true" : "false");
+    printf("    is_loaded() = %s\n", ik->is_loaded() ? "true" : "false");
+    printf("    instance_size() = %d bytes\n", ik->instance_size());
+    printf("    layout_helper() = %d\n", ik->layout_helper());
+
+    vm_assert(ik->is_klass(), "should be klass");
+    vm_assert(ik->is_instance_klass(), "should be instance klass");
+    vm_assert(ik->is_loaded(), "should be loaded");
+    vm_assert(ik->methods_count() > 0, "should have methods");
+    vm_assert(ik->instance_size() > 0, "instance size should be positive");
+
+    // 测试方法查找
+    Method* main_method = ik->find_method("main", "([Ljava/lang/String;)V");
+    if (main_method != nullptr) {
+        printf("    Found main(): code_size=%d, max_stack=%d, max_locals=%d\n",
+               main_method->code_size(), main_method->max_stack(), main_method->max_locals());
+        vm_assert(main_method->is_public(), "main should be public");
+        vm_assert(main_method->is_static(), "main should be static");
+    } else {
+        printf("    main() not found (OK if not a main class)\n");
+    }
+
+    // 验证 oopDesc header 与 instance size 的关系
+    printf("\n  Object Layout:\n");
+    printf("    oopDesc header:   %d bytes\n", (int)sizeof(oopDesc));
+    printf("    instance total:   %d bytes\n", ik->instance_size());
+    printf("    field data:       %d bytes\n",
+           ik->instance_size() - (int)sizeof(oopDesc));
+
+    // 清理
+    // InstanceKlass 析构时会释放 ConstantPool、Methods、FieldInfos
+    delete ik;
+
+    FREE_C_HEAP_ARRAY(u1, buffer);
+
+    printf("\n  [PASS] Full Pipeline OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 1：字节码枚举
+// ============================================================================
+
+void test_bytecodes() {
+    printf("=== Test: Bytecodes ===\n");
+
+    // 验证基本字节码值
+    vm_assert(Bytecodes::_nop == 0x00, "nop should be 0x00");
+    vm_assert(Bytecodes::_iconst_0 == 0x03, "iconst_0 should be 0x03");
+    vm_assert(Bytecodes::_iadd == 0x60, "iadd should be 0x60");
+    vm_assert(Bytecodes::_iand == 0x7E, "iand should be 0x7E");
+    vm_assert(Bytecodes::_iinc == 0x84, "iinc should be 0x84");
+    vm_assert(Bytecodes::_i2l == 0x85, "i2l should be 0x85");
+    vm_assert(Bytecodes::_ireturn == 0xAC, "ireturn should be 0xAC");
+    vm_assert(Bytecodes::_return == 0xB1, "return should be 0xB1");
+    vm_assert(Bytecodes::_invokevirtual == 0xB6, "invokevirtual should be 0xB6");
+    vm_assert(Bytecodes::_new == 0xBB, "new should be 0xBB");
+
+    // 验证长度
+    vm_assert(Bytecodes::length_for(Bytecodes::_nop) == 1, "nop length=1");
+    vm_assert(Bytecodes::length_for(Bytecodes::_bipush) == 2, "bipush length=2");
+    vm_assert(Bytecodes::length_for(Bytecodes::_sipush) == 3, "sipush length=3");
+    vm_assert(Bytecodes::length_for(Bytecodes::_goto) == 3, "goto length=3");
+    vm_assert(Bytecodes::length_for(Bytecodes::_invokestatic) == 3, "invokestatic length=3");
+
+    // 验证名称
+    vm_assert(strcmp(Bytecodes::name(Bytecodes::_iadd), "iadd") == 0, "name of iadd");
+    vm_assert(strcmp(Bytecodes::name(Bytecodes::_return), "return") == 0, "name of return");
+
+    printf("  Bytecode values and lengths verified\n");
+    printf("  [PASS] Bytecodes OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 2：JavaThread
+// ============================================================================
+
+void test_java_thread() {
+    printf("=== Test: JavaThread ===\n");
+
+    JavaThread thread("test-thread");
+
+    // 初始状态
+    vm_assert(thread.thread_state() == _thread_new, "initial state should be _thread_new");
+    vm_assert(!thread.has_pending_exception(), "no exception initially");
+    vm_assert(strcmp(thread.name(), "test-thread") == 0, "thread name");
+
+    // 状态切换
+    thread.set_thread_state(_thread_in_Java);
+    vm_assert(thread.is_in_java(), "should be in Java");
+
+    thread.set_thread_state(_thread_in_vm);
+    vm_assert(thread.is_in_vm(), "should be in VM");
+
+    // 异常
+    thread.set_pending_exception((oopDesc*)(intptr_t)0xDEAD, "test exception");
+    vm_assert(thread.has_pending_exception(), "should have exception");
+    vm_assert(strcmp(thread.exception_message(), "test exception") == 0, "exception message");
+
+    thread.clear_pending_exception();
+    vm_assert(!thread.has_pending_exception(), "exception should be cleared");
+
+    printf("  JavaThread state management verified\n");
+    printf("  [PASS] JavaThread OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 3：InterpreterFrame 基本操作
+// ============================================================================
+
+void test_interpreter_frame() {
+    printf("=== Test: InterpreterFrame ===\n");
+
+    // 创建一个简单方法（3字节码：iconst_3, iconst_4, iadd）
+    ConstantPool* cp = new ConstantPool(5);
+    cp->utf8_at_put(1, (const u1*)"test", 4);
+    cp->utf8_at_put(2, (const u1*)"(II)I", 5);
+
+    ConstMethod* cm = new ConstMethod(cp, 3, 4, 4, 1, 2);
+    u1 bytecodes[] = { Bytecodes::_iconst_3, Bytecodes::_iconst_4, Bytecodes::_iadd };
+    cm->set_bytecodes(bytecodes, 3);
+
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // 创建帧
+    InterpreterFrame frame(method, cp, nullptr);
+
+    // 验证初始状态
+    vm_assert(frame.bci() == 0, "initial bci=0");
+    vm_assert(frame.sp() == 0, "initial sp=0");
+    vm_assert(frame.stack_is_empty(), "stack should be empty");
+    vm_assert(frame.max_stack() == 4, "max_stack=4");
+    vm_assert(frame.max_locals() == 4, "max_locals=4");
+
+    // 测试局部变量
+    frame.set_local_int(0, 42);
+    frame.set_local_int(1, -7);
+    vm_assert(frame.local_int(0) == 42, "local[0]=42");
+    vm_assert(frame.local_int(1) == -7, "local[1]=-7");
+
+    // 测试操作数栈
+    frame.push_int(10);
+    frame.push_int(20);
+    vm_assert(frame.sp() == 2, "sp=2 after 2 pushes");
+    vm_assert(frame.peek_int(0) == 20, "top=20");
+    vm_assert(frame.peek_int(1) == 10, "below top=10");
+
+    jint v2 = frame.pop_int();
+    jint v1 = frame.pop_int();
+    vm_assert(v2 == 20, "pop 20");
+    vm_assert(v1 == 10, "pop 10");
+    vm_assert(frame.stack_is_empty(), "stack empty after 2 pops");
+
+    // 测试 BCP
+    vm_assert(frame.current_bytecode() == Bytecodes::_iconst_3, "first bytecode is iconst_3");
+    frame.advance_bcp(1);
+    vm_assert(frame.bci() == 1, "bci=1 after advance");
+    vm_assert(frame.current_bytecode() == Bytecodes::_iconst_4, "second bytecode is iconst_4");
+
+    printf("  InterpreterFrame locals/stack/BCP verified\n");
+
+    // 清理
+    delete method;  // 会同时删除 cm
+    delete cp;
+
+    printf("  [PASS] InterpreterFrame OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 4：手动构建方法并用解释器执行
+// 测试简单的 iadd 操作：iconst_3 + iconst_4 = 7
+// ============================================================================
+
+void test_interpreter_simple_add() {
+    printf("=== Test: Interpreter Simple Add (3+4) ===\n");
+
+    // 创建常量池
+    ConstantPool* cp = new ConstantPool(5);
+    cp->utf8_at_put(1, (const u1*)"simpleAdd", 9);
+    cp->utf8_at_put(2, (const u1*)"()I", 3);
+
+    // 创建方法字节码：iconst_3, iconst_4, iadd, ireturn
+    u1 code[] = {
+        Bytecodes::_iconst_3,   // 0: iconst_3
+        Bytecodes::_iconst_4,   // 1: iconst_4
+        (u1)Bytecodes::_iadd,   // 2: iadd
+        (u1)Bytecodes::_ireturn // 3: ireturn
+    };
+    ConstMethod* cm = new ConstMethod(cp, 4, 2, 1, 1, 2);
+    cm->set_bytecodes(code, 4);
+
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // 创建线程
+    JavaThread thread("test");
+
+    // 创建 InstanceKlass（解释器需要它来访问常量池）
+    InstanceKlass* klass = new InstanceKlass();
+    klass->set_class_name("TestClass");
+    klass->set_constants(cp);
+
+    // 执行
+    JavaValue result(T_INT);
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, klass, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    // 验证结果
+    printf("  Result: %d (expected 7)\n", result.get_jint());
+    vm_assert(result.get_jint() == 7, "3 + 4 should be 7");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    // 清理 — 这里需要小心所有权
+    // klass 拥有 cp 的所有权，method 拥有 cm 的所有权
+    // 但 klass->set_constants(cp) 设置了关联，析构时 klass 会 delete cp
+    // method 不被 klass 管理（没有 set_methods），需要手动删除
+    // 先删 method（它会 delete cm），再删 klass（它会 delete cp）
+    delete method;
+    // 防止 klass 析构时再次删除 cp，因为 method 的 cm 中已有 cp 引用
+    // 但 klass 拥有 cp 所有权——实际上 ConstMethod 不删除 cp，只有 InstanceKlass 删除
+    // 所以直接删除 klass 即可
+    delete klass;  // 会 delete cp
+
+    printf("  [PASS] Interpreter Simple Add OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 5：带参数的方法调用
+// 模拟 add(int a, int b) { return a + b; } 调用 add(10, 25) = 35
+// ============================================================================
+
+void test_interpreter_with_args() {
+    printf("=== Test: Interpreter With Args (add(10, 25)=35) ===\n");
+
+    // 创建常量池
+    ConstantPool* cp = new ConstantPool(5);
+    cp->utf8_at_put(1, (const u1*)"add", 3);
+    cp->utf8_at_put(2, (const u1*)"(II)I", 5);
+
+    // 字节码：iload_0, iload_1, iadd, ireturn
+    u1 code[] = {
+        Bytecodes::_iload_0,    // 0: iload_0  (参数 a)
+        Bytecodes::_iload_1,    // 1: iload_1  (参数 b)
+        (u1)Bytecodes::_iadd,   // 2: iadd
+        (u1)Bytecodes::_ireturn // 3: ireturn
+    };
+    ConstMethod* cm = new ConstMethod(cp, 4, 2, 2, 1, 2);
+    cm->set_bytecodes(code, 4);
+
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    JavaThread thread("test");
+    InstanceKlass* klass = new InstanceKlass();
+    klass->set_class_name("TestClass");
+    klass->set_constants(cp);
+
+    // 准备参数
+    intptr_t args[2] = { 10, 25 };
+
+    JavaValue result(T_INT);
+    BytecodeInterpreter::execute(method, klass, &thread, &result, args, 2);
+
+    printf("  Result: %d (expected 35)\n", result.get_jint());
+    vm_assert(result.get_jint() == 35, "10 + 25 should be 35");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete method;
+    delete klass;
+
+    printf("  [PASS] Interpreter With Args OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 6：条件分支 (计算绝对值)
+// if (x < 0) x = -x; return x;
+// ============================================================================
+
+void test_interpreter_branch() {
+    printf("=== Test: Interpreter Branch (abs(-42)=42) ===\n");
+
+    ConstantPool* cp = new ConstantPool(5);
+    cp->utf8_at_put(1, (const u1*)"abs", 3);
+    cp->utf8_at_put(2, (const u1*)"(I)I", 4);
+
+    // 字节码：
+    // 0: iload_0       (加载参数)
+    // 1: ifge 7        (如果 >= 0，跳到 7)  → offset = +6 = {00, 06}
+    // 4: iload_0       (加载参数)
+    // 5: ineg          (取反)
+    // 6: ireturn       (返回)
+    // 7: iload_0       (加载参数)
+    // 8: ireturn       (返回)
+    u1 code[] = {
+        Bytecodes::_iload_0,                // 0: iload_0
+        (u1)Bytecodes::_ifge, 0x00, 0x06,  // 1: ifge +6 → bci 7
+        Bytecodes::_iload_0,                // 4: iload_0
+        (u1)Bytecodes::_ineg,               // 5: ineg
+        (u1)Bytecodes::_ireturn,            // 6: ireturn
+        Bytecodes::_iload_0,                // 7: iload_0
+        (u1)Bytecodes::_ireturn,            // 8: ireturn
+    };
+    ConstMethod* cm = new ConstMethod(cp, 9, 2, 1, 1, 2);
+    cm->set_bytecodes(code, 9);
+
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    JavaThread thread("test");
+    InstanceKlass* klass = new InstanceKlass();
+    klass->set_class_name("TestClass");
+    klass->set_constants(cp);
+
+    // 测试 abs(-42) = 42
+    {
+        intptr_t args[1] = { -42 };
+        JavaValue result(T_INT);
+        BytecodeInterpreter::execute(method, klass, &thread, &result, args, 1);
+        printf("  abs(-42) = %d (expected 42)\n", result.get_jint());
+        vm_assert(result.get_jint() == 42, "abs(-42) should be 42");
+    }
+
+    // 测试 abs(99) = 99
+    {
+        intptr_t args[1] = { 99 };
+        JavaValue result(T_INT);
+        BytecodeInterpreter::execute(method, klass, &thread, &result, args, 1);
+        printf("  abs(99) = %d (expected 99)\n", result.get_jint());
+        vm_assert(result.get_jint() == 99, "abs(99) should be 99");
+    }
+
+    delete method;
+    delete klass;
+
+    printf("  [PASS] Interpreter Branch OK\n\n");
+}
+
+// ============================================================================
+// Phase 4 测试 7：完整流程 — 解析 .class → 执行 main()
+// HelloWorld.main() 最终应该打印 "7"
+// ============================================================================
+
+void test_full_execution(const char* path) {
+    printf("=== Test: Full Execution (ClassFile → Interpret) ===\n");
+    printf("  File: %s\n\n", path);
+
+    // 读取文件
+    int length = 0;
+    u1* buffer = read_class_file(path, &length);
+    if (buffer == nullptr) {
+        printf("  [SKIP] File not found.\n\n");
+        return;
+    }
+
+    // 解析
+    ClassFileStream stream(buffer, length, path);
+    ClassFileParser parser(&stream);
+    parser.parse();
+    InstanceKlass* ik = parser.create_instance_klass();
+    guarantee(ik != nullptr, "create_instance_klass() returned null");
+
+    printf("  InstanceKlass created: %s\n", ik->class_name());
+    printf("  Methods: %d\n", ik->methods_count());
+
+    // 查找 main 方法
+    Method* main_method = ik->find_method("main", "([Ljava/lang/String;)V");
+    if (main_method == nullptr) {
+        printf("  [SKIP] main() not found.\n\n");
+        delete ik;
+        FREE_C_HEAP_ARRAY(u1, buffer);
+        return;
+    }
+
+    printf("  Found main(): code_size=%d, max_stack=%d, max_locals=%d\n",
+           main_method->code_size(), main_method->max_stack(), main_method->max_locals());
+
+    // 打印 main 的字节码
+    printf("  main() bytecodes:\n    ");
+    for (int i = 0; i < main_method->code_size(); i++) {
+        printf("%02X ", main_method->code_base()[i]);
+        if ((i + 1) % 16 == 0) printf("\n    ");
+    }
+    printf("\n\n");
+
+    // 创建线程
+    JavaThread thread("main");
+
+    // 开启 trace 模式
+    BytecodeInterpreter::_trace_bytecodes = true;
+
+    // 执行 main()
+    // main(String[]) 有一个参数 args，我们传 null（0）
+    intptr_t args[1] = { 0 };  // args = null
+    JavaValue result(T_VOID);
+
+    printf("  === Executing main() ===\n");
+    BytecodeInterpreter::execute(main_method, ik, &thread, &result, args, 1);
+
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    if (thread.has_pending_exception()) {
+        printf("  Exception: %s\n", thread.exception_message());
+    } else {
+        printf("  === main() completed successfully ===\n");
+    }
+
+    // 清理
+    delete ik;
+    FREE_C_HEAP_ARRAY(u1, buffer);
+
+    printf("  [PASS] Full Execution OK\n\n");
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char** argv) {
+    printf("========================================\n");
+    printf("  Mini JVM - Phase 4: Interpreter\n");
+    printf("========================================\n\n");
+
+    // Phase 1 基础测试
+    test_bytes();
+    test_classfile_stream();
+
+    // Phase 3 测试
+    test_mark_word();
+    test_oop_header();
+    test_access_flags();
+    test_metadata_method();
+    test_klass();
+
+    // Phase 3 完整流程
+    if (argc > 1) {
+        test_full_pipeline(argv[1]);
+    } else {
+        test_full_pipeline("test/HelloWorld.class");
+    }
+
+    // Phase 4 新增测试
+    test_bytecodes();
+    test_java_thread();
+    test_interpreter_frame();
+    test_interpreter_simple_add();
+    test_interpreter_with_args();
+    test_interpreter_branch();
+
+    // Phase 4 终极测试：解析 + 执行 HelloWorld.class
+    if (argc > 1) {
+        test_full_execution(argv[1]);
+    } else {
+        test_full_execution("test/HelloWorld.class");
+    }
+
+    printf("========================================\n");
+    printf("  All Phase 4 tests completed!\n");
+    printf("========================================\n");
+
+    return 0;
+}

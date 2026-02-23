@@ -1,0 +1,3 @@
+/data/workspace/my_jvm_11/build/CMakeFiles/mini_jvm.dir
+/data/workspace/my_jvm_11/build/CMakeFiles/edit_cache.dir
+/data/workspace/my_jvm_11/build/CMakeFiles/rebuild_cache.dir

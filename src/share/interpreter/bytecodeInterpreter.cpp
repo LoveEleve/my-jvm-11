@@ -8,6 +8,7 @@
 // ============================================================================
 
 #include "interpreter/bytecodeInterpreter.hpp"
+#include "gc/shared/javaHeap.hpp"
 
 bool BytecodeInterpreter::_trace_bytecodes = false;
 
@@ -685,7 +686,7 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
         }
 
         // ================================================================
-        // 字段访问（桩实现）
+        // 字段访问（Phase 5: 真实实现）
         // ================================================================
 
         case Bytecodes::_getstatic: {
@@ -696,36 +697,34 @@ void BytecodeInterpreter::run(InterpreterFrame* frame,
         }
 
         case Bytecodes::_putstatic: {
-            // 简化：弹出值并丢弃
-            frame->pop_raw();
+            u2 cp_index = (u2)frame->read_u2_operand(1);
+            handle_putstatic(frame, klass, cp_index);
             frame->advance_bcp(3);
             break;
         }
 
         case Bytecodes::_getfield: {
-            // 简化版：弹出 objectref，压入 0
-            frame->pop_oop();
-            frame->push_int(0);
+            u2 cp_index = (u2)frame->read_u2_operand(1);
+            handle_getfield(frame, klass, cp_index);
             frame->advance_bcp(3);
             break;
         }
 
         case Bytecodes::_putfield: {
-            // 简化版：弹出 value 和 objectref
-            frame->pop_raw();  // value
-            frame->pop_raw();  // objectref
+            u2 cp_index = (u2)frame->read_u2_operand(1);
+            handle_putfield(frame, klass, thread, cp_index);
             frame->advance_bcp(3);
             break;
         }
 
         // ================================================================
-        // 对象创建（桩实现）
+        // 对象创建（Phase 5: 真实实现）
         // ================================================================
 
         case Bytecodes::_new: {
-            // 简化：压入一个非空标记值作为 objectref
-            // 真正的对象创建需要 GC 和堆分配，后续实现
-            frame->push_oop((oopDesc*)(intptr_t)0xDEAD0001);
+            u2 cp_index = (u2)frame->read_u2_operand(1);
+            handle_new(frame, klass, thread, cp_index);
+            if (thread->has_pending_exception()) return;
             frame->advance_bcp(3);
             break;
         }
@@ -931,10 +930,24 @@ void BytecodeInterpreter::invoke_method(InterpreterFrame* frame,
 }
 
 // ============================================================================
-// handle_getstatic — 处理 getstatic（简化桩）
+// resolve_field_type — 解析 Fieldref 的字段类型
+// 返回描述符的第一个字符，用于确定字段大小
+// ============================================================================
+
+char BytecodeInterpreter::resolve_field_type(ConstantPool* cp, u2 cp_index) {
+    u2 nat_index = cp->unchecked_name_and_type_ref_index_at(cp_index);
+    u2 desc_index = (u2)cp->signature_ref_index_at(nat_index);
+    const char* desc = cp->utf8_at(desc_index);
+    return desc[0];
+}
+
+// ============================================================================
+// handle_getstatic — 处理 getstatic
 //
-// 对于 System.out 等标准库字段，压入一个标记值。
-// 后续实现完整的字段解析后替换。
+// Phase 5: 真实静态字段访问
+//   1. 解析 Fieldref → 类名.字段名:描述符
+//   2. 如果是当前类的字段 → 从 _static_fields 数组读取
+//   3. 如果是外部类（如 System.out）→ 保留桩处理
 // ============================================================================
 
 void BytecodeInterpreter::handle_getstatic(InterpreterFrame* frame,
@@ -951,24 +964,418 @@ void BytecodeInterpreter::handle_getstatic(InterpreterFrame* frame,
     u2 desc_index = (u2)cp->signature_ref_index_at(nat_index);
 
     const char* field_name = cp->utf8_at(name_index);
+    const char* field_desc = cp->utf8_at(desc_index);
+    const char* class_name = cp->klass_name_at(class_index);
 
     if (_trace_bytecodes) {
-        const char* class_name = cp->klass_name_at(class_index);
-        const char* field_desc = cp->utf8_at(desc_index);
         fprintf(stderr, "  [GETSTATIC] %s.%s:%s (cp#%d)\n",
                 class_name, field_name, field_desc, cp_index);
     }
 
-    // 对 System.out 压入一个标记值（模拟 PrintStream 对象引用）
-    if (strcmp(field_name, "out") == 0) {
+    // 判断是否是当前类的字段
+    bool is_same_class = (strcmp(class_name, klass->class_name()) == 0);
+
+    if (is_same_class) {
+        // 当前类的静态字段 → 从 _static_fields 数组读取
+        int idx = klass->static_field_index(field_name);
+        if (idx >= 0) {
+            intptr_t value = klass->static_field_value(idx);
+            // 根据描述符类型压栈
+            switch (field_desc[0]) {
+                case 'J':  // long
+                    frame->push_long((jlong)value);
+                    break;
+                case 'D': { // double
+                    jdouble dval;
+                    memcpy(&dval, &value, sizeof(jdouble));
+                    frame->push_double(dval);
+                    break;
+                }
+                case 'L': case '[':  // reference
+                    frame->push_oop((oopDesc*)value);
+                    break;
+                default:  // int, short, byte, char, boolean, float
+                    frame->push_int((jint)value);
+                    break;
+            }
+            return;
+        }
+    }
+
+    // 外部类的静态字段：保留桩处理
+    // System.out → PrintStream 标记值
+    if (strcmp(field_name, "out") == 0 &&
+        strcmp(class_name, "java/lang/System") == 0) {
         frame->push_oop((oopDesc*)(intptr_t)0xDEAD0002);  // PrintStream 标记
     } else {
-        frame->push_int(0);  // 其他静态字段默认 0
+        // 其他外部静态字段默认值
+        if (field_desc[0] == 'J' || field_desc[0] == 'D') {
+            frame->push_long(0);  // long/double 默认 0
+        } else {
+            frame->push_int(0);
+        }
     }
 }
 
 // ============================================================================
-// handle_invokevirtual — 处理 invokevirtual（简化桩）
+// handle_putstatic — 处理 putstatic
+//
+// Phase 5: 真实静态字段写入
+//   1. 解析 Fieldref
+//   2. 如果是当前类 → 写入 _static_fields 数组
+//   3. 如果是外部类 → 弹出值丢弃
+// ============================================================================
+
+void BytecodeInterpreter::handle_putstatic(InterpreterFrame* frame,
+                                            InstanceKlass* klass,
+                                            u2 cp_index)
+{
+    ConstantPool* cp = klass->constants();
+
+    u2 class_index = cp->unchecked_klass_ref_index_at(cp_index);
+    u2 nat_index = cp->unchecked_name_and_type_ref_index_at(cp_index);
+
+    u2 name_index = (u2)cp->name_ref_index_at(nat_index);
+    u2 desc_index = (u2)cp->signature_ref_index_at(nat_index);
+
+    const char* field_name = cp->utf8_at(name_index);
+    const char* field_desc = cp->utf8_at(desc_index);
+    const char* class_name = cp->klass_name_at(class_index);
+
+    if (_trace_bytecodes) {
+        fprintf(stderr, "  [PUTSTATIC] %s.%s:%s (cp#%d)\n",
+                class_name, field_name, field_desc, cp_index);
+    }
+
+    bool is_same_class = (strcmp(class_name, klass->class_name()) == 0);
+
+    if (is_same_class) {
+        int idx = klass->static_field_index(field_name);
+        if (idx >= 0) {
+            // 根据类型弹出值
+            intptr_t value;
+            switch (field_desc[0]) {
+                case 'J':  // long
+                    value = (intptr_t)frame->pop_long();
+                    break;
+                case 'D': { // double
+                    jdouble dval = frame->pop_double();
+                    memcpy(&value, &dval, sizeof(jdouble));
+                    break;
+                }
+                case 'L': case '[':  // reference
+                    value = (intptr_t)frame->pop_oop();
+                    break;
+                default:  // int, short, byte, char, boolean, float
+                    value = (intptr_t)frame->pop_int();
+                    break;
+            }
+            klass->set_static_field_value(idx, value);
+            return;
+        }
+    }
+
+    // 外部类：弹出值丢弃
+    if (field_desc[0] == 'J' || field_desc[0] == 'D') {
+        frame->pop_long();
+    } else {
+        frame->pop_raw();
+    }
+}
+
+// ============================================================================
+// handle_getfield — 处理 getfield
+//
+// Phase 5: 真实实例字段读取
+//   1. 解析 Fieldref → 字段名 + 描述符
+//   2. 在当前类的字段表中查找该字段
+//   3. 弹出 objectref
+//   4. 根据字段偏移和类型从对象中读取值并压栈
+// ============================================================================
+
+void BytecodeInterpreter::handle_getfield(InterpreterFrame* frame,
+                                           InstanceKlass* klass,
+                                           u2 cp_index)
+{
+    ConstantPool* cp = klass->constants();
+
+    u2 nat_index = cp->unchecked_name_and_type_ref_index_at(cp_index);
+    u2 name_index = (u2)cp->name_ref_index_at(nat_index);
+    u2 desc_index = (u2)cp->signature_ref_index_at(nat_index);
+
+    const char* field_name = cp->utf8_at(name_index);
+    const char* field_desc = cp->utf8_at(desc_index);
+
+    if (_trace_bytecodes) {
+        u2 class_index = cp->unchecked_klass_ref_index_at(cp_index);
+        const char* class_name = cp->klass_name_at(class_index);
+        fprintf(stderr, "  [GETFIELD] %s.%s:%s (cp#%d)\n",
+                class_name, field_name, field_desc, cp_index);
+    }
+
+    // 弹出 objectref
+    oopDesc* obj = frame->pop_oop();
+    if (obj == nullptr) {
+        fprintf(stderr, "ERROR: NullPointerException at getfield %s\n", field_name);
+        frame->push_int(0);
+        return;
+    }
+
+    // 在当前类中查找字段信息获取偏移
+    const FieldInfoEntry* field = klass->find_field(field_name);
+    if (field == nullptr || field->is_static()) {
+        fprintf(stderr, "WARNING: getfield — field %s not found or is static\n", field_name);
+        frame->push_int(0);
+        return;
+    }
+
+    int offset = field->offset;
+
+    // 根据描述符类型读取并压栈
+    switch (field_desc[0]) {
+        case 'I':  // int
+            frame->push_int(obj->int_field(offset));
+            break;
+        case 'J':  // long
+            frame->push_long(obj->long_field(offset));
+            break;
+        case 'F':  // float
+            frame->push_float(obj->float_field(offset));
+            break;
+        case 'D':  // double
+            frame->push_double(obj->double_field(offset));
+            break;
+        case 'B':  // byte
+            frame->push_int((jint)obj->byte_field(offset));
+            break;
+        case 'Z':  // boolean
+            frame->push_int((jint)obj->bool_field(offset));
+            break;
+        case 'S':  // short
+            frame->push_int((jint)obj->short_field(offset));
+            break;
+        case 'C':  // char
+            frame->push_int((jint)obj->char_field(offset));
+            break;
+        case 'L': case '[':  // reference
+            frame->push_oop(obj->obj_field(offset));
+            break;
+        default:
+            fprintf(stderr, "WARNING: getfield — unknown descriptor '%c'\n", field_desc[0]);
+            frame->push_int(0);
+            break;
+    }
+}
+
+// ============================================================================
+// handle_putfield — 处理 putfield
+//
+// Phase 5: 真实实例字段写入
+//   1. 解析 Fieldref → 字段名 + 描述符
+//   2. 弹出 value 和 objectref
+//   3. 根据字段偏移和类型写入对象
+// ============================================================================
+
+void BytecodeInterpreter::handle_putfield(InterpreterFrame* frame,
+                                           InstanceKlass* klass,
+                                           JavaThread* thread,
+                                           u2 cp_index)
+{
+    ConstantPool* cp = klass->constants();
+
+    u2 nat_index = cp->unchecked_name_and_type_ref_index_at(cp_index);
+    u2 name_index = (u2)cp->name_ref_index_at(nat_index);
+    u2 desc_index = (u2)cp->signature_ref_index_at(nat_index);
+
+    const char* field_name = cp->utf8_at(name_index);
+    const char* field_desc = cp->utf8_at(desc_index);
+
+    if (_trace_bytecodes) {
+        u2 class_index = cp->unchecked_klass_ref_index_at(cp_index);
+        const char* class_name = cp->klass_name_at(class_index);
+        fprintf(stderr, "  [PUTFIELD] %s.%s:%s (cp#%d)\n",
+                class_name, field_name, field_desc, cp_index);
+    }
+
+    // 在当前类中查找字段
+    const FieldInfoEntry* field = klass->find_field(field_name);
+    if (field == nullptr || field->is_static()) {
+        fprintf(stderr, "WARNING: putfield — field %s not found or is static\n", field_name);
+        // 需要弹出 value 和 objectref
+        if (field_desc[0] == 'J' || field_desc[0] == 'D') {
+            frame->pop_long();  // value (2 slots)
+        } else {
+            frame->pop_raw();   // value (1 slot)
+        }
+        frame->pop_raw();  // objectref
+        return;
+    }
+
+    int offset = field->offset;
+
+    // 根据描述符类型弹出值并写入
+    switch (field_desc[0]) {
+        case 'I': {
+            jint value = frame->pop_int();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->int_field_put(offset, value);
+            break;
+        }
+        case 'J': {
+            jlong value = frame->pop_long();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->long_field_put(offset, value);
+            break;
+        }
+        case 'F': {
+            jfloat value = frame->pop_float();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->float_field_put(offset, value);
+            break;
+        }
+        case 'D': {
+            jdouble value = frame->pop_double();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->double_field_put(offset, value);
+            break;
+        }
+        case 'B': {
+            jint value = frame->pop_int();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->byte_field_put(offset, (jbyte)value);
+            break;
+        }
+        case 'Z': {
+            jint value = frame->pop_int();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->bool_field_put(offset, (jboolean)value);
+            break;
+        }
+        case 'S': {
+            jint value = frame->pop_int();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->short_field_put(offset, (jshort)value);
+            break;
+        }
+        case 'C': {
+            jint value = frame->pop_int();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->char_field_put(offset, (jchar)value);
+            break;
+        }
+        case 'L': case '[': {
+            oopDesc* value = frame->pop_oop();
+            oopDesc* obj = frame->pop_oop();
+            if (obj == nullptr) {
+                fprintf(stderr, "ERROR: NullPointerException at putfield %s\n", field_name);
+                return;
+            }
+            obj->obj_field_put(offset, value);
+            break;
+        }
+        default: {
+            fprintf(stderr, "WARNING: putfield — unknown descriptor '%c'\n", field_desc[0]);
+            frame->pop_raw();  // value
+            frame->pop_raw();  // objectref
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// handle_new — 处理 new 字节码
+//
+// Phase 5: 真实对象创建
+//
+// 对应 HotSpot 的执行链：
+//   _new bytecode → InterpreterRuntime::_new()
+//   → InstanceKlass::allocate_instance()
+//   → CollectedHeap::obj_allocate()
+//   → bump-pointer / TLAB
+//
+// 我们的简化版：
+//   1. 从常量池解析 Class 索引 → 类名
+//   2. 简化：只支持当前类（没有类加载器）
+//   3. 调用 klass->allocate_instance() 在 JavaHeap 上分配
+//   4. 压入 objectref
+// ============================================================================
+
+void BytecodeInterpreter::handle_new(InterpreterFrame* frame,
+                                      InstanceKlass* klass,
+                                      JavaThread* thread,
+                                      u2 cp_index)
+{
+    ConstantPool* cp = klass->constants();
+
+    // 解析 Class 索引 → 类名
+    const char* class_name = cp->klass_name_at(cp_index);
+
+    if (_trace_bytecodes) {
+        fprintf(stderr, "  [NEW] %s (cp#%d)\n", class_name, cp_index);
+    }
+
+    // 简化：只支持创建当前类的实例
+    // 真实 JVM 需要通过 SystemDictionary 查找/加载目标类
+    bool is_same_class = (strcmp(class_name, klass->class_name()) == 0);
+
+    if (!is_same_class) {
+        // 外部类：无法创建，压入标记值（保持向后兼容）
+        if (_trace_bytecodes) {
+            fprintf(stderr, "  [NEW] %s — external class, using marker\n", class_name);
+        }
+        frame->push_oop((oopDesc*)(intptr_t)0xDEAD0001);
+        return;
+    }
+
+    // 从 JavaHeap 分配对象
+    oopDesc* obj = klass->allocate_instance();
+    if (obj == nullptr) {
+        thread->set_pending_exception(nullptr, "java.lang.OutOfMemoryError: Java heap space");
+        return;
+    }
+
+    if (_trace_bytecodes) {
+        fprintf(stderr, "  [NEW] Allocated %s at %p (%d bytes)\n",
+                class_name, (void*)obj, klass->instance_size());
+    }
+
+    frame->push_oop(obj);
+}
+
+// ============================================================================
+// handle_invokevirtual — 处理 invokevirtual
 //
 // 特殊处理：
 //   - PrintStream.println(I)V → 实际打印整数到 stdout
@@ -1028,7 +1435,3 @@ void BytecodeInterpreter::handle_invokevirtual(InterpreterFrame* frame,
     // 普通 invokevirtual → 在当前类查找并执行
     invoke_method(frame, klass, thread, cp_index, false);
 }
-
-// ============================================================================
-// 辅助：打印常量池中 class 的名称
-// ============================================================================

@@ -4,6 +4,7 @@
 // ============================================================================
 
 #include "oops/instanceKlass.hpp"
+#include "gc/shared/javaHeap.hpp"
 #include <cstring>
 
 // ============================================================================
@@ -30,7 +31,9 @@ InstanceKlass::InstanceKlass()
       _major_version(0),
       _source_file_name_index(0),
       _class_name(nullptr),
-      _super_class_name(nullptr)
+      _super_class_name(nullptr),
+      _static_fields(nullptr),
+      _static_fields_count(0)
 {}
 
 InstanceKlass::~InstanceKlass() {
@@ -60,6 +63,11 @@ InstanceKlass::~InstanceKlass() {
     }
     if (_super_class_name != nullptr) {
         FREE_C_HEAP_ARRAY(char, _super_class_name);
+    }
+
+    // 释放静态字段数组
+    if (_static_fields != nullptr) {
+        FREE_C_HEAP_ARRAY(intptr_t, _static_fields);
     }
 
     // 释放常量池（InstanceKlass 拥有所有权）
@@ -204,6 +212,30 @@ InstanceKlass* InstanceKlass::create_from_parser(
         ik->set_has_nonstatic_fields();
     }
 
+    // Phase 5: 初始化静态字段存储
+    // 统计静态字段数量并分配存储数组
+    int static_count = 0;
+    for (int i = 0; i < fields_count; i++) {
+        if (fields[i].is_static()) {
+            static_count++;
+        }
+    }
+    if (static_count > 0) {
+        ik->_static_fields = NEW_C_HEAP_ARRAY(intptr_t, static_count, mtClass);
+        memset(ik->_static_fields, 0, sizeof(intptr_t) * static_count);
+        ik->_static_fields_count = static_count;
+
+        // 为每个静态字段分配 static_fields 数组中的索引
+        // 复用 FieldInfoEntry::offset 字段来存储索引
+        int static_idx = 0;
+        for (int i = 0; i < fields_count; i++) {
+            if (fields[i].is_static()) {
+                fields[i].offset = (u2)static_idx;
+                static_idx++;
+            }
+        }
+    }
+
     // 设置状态为 loaded
     ik->set_init_state(loaded);
 
@@ -278,4 +310,71 @@ void InstanceKlass::print_summary(FILE* out) const {
         }
     }
     fprintf(out, "\n");
+}
+
+// ============================================================================
+// Phase 5: 对象分配
+//
+// 对应 HotSpot: InstanceKlass::allocate_instance()
+//   → CollectedHeap::obj_allocate(klass, size)
+//     → MemAllocator::allocate()
+//       → mem_allocate() + finish()
+//
+// 流程：
+//   1. 获取 instance_size()
+//   2. 从 JavaHeap 分配
+//   3. 返回初始化好的 oopDesc*
+// ============================================================================
+
+oopDesc* InstanceKlass::allocate_instance() {
+    int size = instance_size();
+    guarantee(size > 0, "instance_size must be positive");
+
+    JavaHeap* heap = JavaHeap::heap();
+    guarantee(heap != nullptr, "JavaHeap not initialized");
+
+    oopDesc* obj = heap->obj_allocate(this, size);
+    if (obj == nullptr) {
+        fprintf(stderr, "ERROR: Failed to allocate instance of %s (%d bytes)\n",
+                _class_name ? _class_name : "<null>", size);
+        return nullptr;
+    }
+
+    return obj;
+}
+
+// ============================================================================
+// Phase 5: 静态字段访问
+// ============================================================================
+
+intptr_t InstanceKlass::static_field_value(int field_index) const {
+    vm_assert(field_index >= 0 && field_index < _static_fields_count,
+              "static field index out of bounds");
+    return _static_fields[field_index];
+}
+
+void InstanceKlass::set_static_field_value(int field_index, intptr_t value) {
+    vm_assert(field_index >= 0 && field_index < _static_fields_count,
+              "static field index out of bounds");
+    _static_fields[field_index] = value;
+}
+
+const FieldInfoEntry* InstanceKlass::find_field(const char* name) const {
+    if (_constants == nullptr || _field_infos == nullptr) return nullptr;
+
+    for (int i = 0; i < _fields_count; i++) {
+        const char* field_name = _constants->utf8_at(_field_infos[i].name_index);
+        if (strcmp(field_name, name) == 0) {
+            return &_field_infos[i];
+        }
+    }
+    return nullptr;
+}
+
+int InstanceKlass::static_field_index(const char* name) const {
+    const FieldInfoEntry* entry = find_field(name);
+    if (entry != nullptr && entry->is_static()) {
+        return (int)entry->offset;  // offset 存储的是 static_fields 数组的索引
+    }
+    return -1;
 }

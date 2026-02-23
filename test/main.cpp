@@ -1,6 +1,6 @@
 // ============================================================================
-// Mini JVM - Phase 4 测试入口
-// 测试 OOP-Klass 对象模型 + 字节码解释器
+// Mini JVM - Phase 5 测试入口
+// 测试 OOP-Klass 对象模型 + 字节码解释器 + 对象创建 + 字段访问
 // ============================================================================
 
 #include "utilities/globalDefinitions.hpp"
@@ -24,6 +24,7 @@
 #include "runtime/javaThread.hpp"
 #include "runtime/frame.hpp"
 #include "interpreter/bytecodeInterpreter.hpp"
+#include "gc/shared/javaHeap.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -744,12 +745,365 @@ void test_full_execution(const char* path) {
 }
 
 // ============================================================================
+// Phase 5 测试 1：JavaHeap 基本分配
+// ============================================================================
+
+void test_java_heap_basic() {
+    printf("=== Test: JavaHeap Basic Allocation ===\n");
+
+    // 初始化堆（1MB）
+    JavaHeap::initialize(1 * 1024 * 1024);
+    JavaHeap* heap = JavaHeap::heap();
+
+    vm_assert(heap != nullptr, "heap should be initialized");
+    vm_assert(heap->capacity() == 1 * 1024 * 1024, "capacity should be 1MB");
+    vm_assert(heap->used() == 0, "used should be 0");
+    vm_assert(heap->free() == 1 * 1024 * 1024, "free should be 1MB");
+
+    // 分配一些内存
+    HeapWord* p1 = heap->allocate(2);  // 16 bytes
+    vm_assert(p1 != nullptr, "first allocation should succeed");
+    vm_assert(heap->used() == 16, "used should be 16");
+    vm_assert(heap->is_in(p1), "p1 should be in heap");
+
+    HeapWord* p2 = heap->allocate(4);  // 32 bytes
+    vm_assert(p2 != nullptr, "second allocation should succeed");
+    vm_assert(heap->used() == 48, "used should be 48");
+    vm_assert(p2 > p1, "p2 should be after p1 (bump pointer)");
+
+    // 打印堆状态
+    heap->print_on(stdout);
+
+    // 清理
+    JavaHeap::destroy();
+
+    printf("  [PASS] JavaHeap Basic Allocation OK\n\n");
+}
+
+// ============================================================================
+// Phase 5 测试 2：对象分配（手动创建 InstanceKlass + 分配实例）
+// ============================================================================
+
+void test_object_allocation() {
+    printf("=== Test: Object Allocation ===\n");
+
+    // 初始化堆
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 创建一个简单的类：
+    //   class Point { int x; int y; }
+    //   instance_size = 16 (header) + 4 (x) + 4 (y) = 24 → aligned to 24 bytes
+    ConstantPool* cp = new ConstantPool(10);
+    cp->utf8_at_put(1, (const u1*)"Point", 5);
+    cp->utf8_at_put(2, (const u1*)"x", 1);
+    cp->utf8_at_put(3, (const u1*)"I", 1);
+    cp->utf8_at_put(4, (const u1*)"y", 1);
+    cp->utf8_at_put(5, (const u1*)"I", 1);
+
+    // 字段信息
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 2, mtClass);
+    fields[0] = { 0, 2, 3, FieldInfoEntry::invalid_offset, 0 }; // x: int
+    fields[1] = { 0, 4, 5, FieldInfoEntry::invalid_offset, 0 }; // y: int
+
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_class_name("test/Point");
+    ik->set_constants(cp);
+    ik->set_fields(fields, 2);
+
+    // 手动计算并设置实例大小
+    int instance_size = instanceOopDesc::base_offset_in_bytes() + 4 + 4; // 16 + 4 + 4 = 24
+    instance_size = (int)align_up((uintx)instance_size, (uintx)HeapWordSize);
+    ik->set_instance_size(instance_size);
+
+    // 设置字段偏移
+    fields[0].offset = (u2)instanceOopDesc::base_offset_in_bytes();      // x at 16
+    fields[1].offset = (u2)(instanceOopDesc::base_offset_in_bytes() + 4); // y at 20
+
+    printf("  Class: %s, instance_size=%d\n", ik->class_name(), ik->instance_size());
+    printf("  Field x: offset=%d\n", fields[0].offset);
+    printf("  Field y: offset=%d\n", fields[1].offset);
+
+    // 分配实例
+    oopDesc* obj = ik->allocate_instance();
+    vm_assert(obj != nullptr, "object allocation should succeed");
+
+    printf("  Allocated object at %p\n", (void*)obj);
+
+    // 验证对象头
+    vm_assert(obj->klass() == ik, "klass pointer should point to InstanceKlass");
+    vm_assert(obj->mark()->is_unlocked(), "mark should be unlocked");
+    vm_assert(obj->mark()->age() == 0, "age should be 0");
+
+    // 测试字段读写
+    int x_offset = fields[0].offset;
+    int y_offset = fields[1].offset;
+
+    // 初始值应该是 0（内存已清零）
+    vm_assert(obj->int_field(x_offset) == 0, "x should initially be 0");
+    vm_assert(obj->int_field(y_offset) == 0, "y should initially be 0");
+
+    // 写入字段
+    obj->int_field_put(x_offset, 42);
+    obj->int_field_put(y_offset, 99);
+
+    // 读回验证
+    vm_assert(obj->int_field(x_offset) == 42, "x should be 42");
+    vm_assert(obj->int_field(y_offset) == 99, "y should be 99");
+
+    printf("  x=%d, y=%d\n", obj->int_field(x_offset), obj->int_field(y_offset));
+
+    // 分配第二个对象
+    oopDesc* obj2 = ik->allocate_instance();
+    vm_assert(obj2 != nullptr, "second object should succeed");
+    vm_assert(obj2 > obj, "second object should be at higher address");
+    vm_assert(obj2->int_field(x_offset) == 0, "obj2.x should be 0");
+
+    printf("  Second object at %p (gap=%ld bytes)\n",
+           (void*)obj2, (long)((char*)obj2 - (char*)obj));
+
+    // 堆状态
+    JavaHeap::heap()->print_on(stdout);
+
+    // 清理（堆上的对象不需要单独释放，整个堆一起释放）
+    delete ik;  // 会删除 cp 和 fields
+    JavaHeap::destroy();
+
+    printf("  [PASS] Object Allocation OK\n\n");
+}
+
+// ============================================================================
+// Phase 5 测试 3：解释器中的对象创建和字段访问
+// 手动构建字节码序列模拟：
+//
+//   class Counter {
+//       int count;
+//       static int add(int a, int b) { return a + b; }
+//   }
+//
+// 测试的字节码（手动构建）：
+//   new Counter          // 创建对象
+//   dup                  // 复制引用
+//   invokespecial <init> // 调用构造函数（我们跳过）
+//   astore_1             // 存储到 local[1]
+//   aload_1              // 加载对象引用
+//   bipush 42            // 压入 42
+//   putfield count       // 设置 count=42
+//   aload_1              // 加载对象引用
+//   getfield count       // 获取 count
+//   ireturn              // 返回 count 的值
+// ============================================================================
+
+void test_interpreter_object_creation() {
+    printf("=== Test: Interpreter Object Creation & Field Access ===\n");
+
+    // 初始化堆
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 创建常量池
+    // 需要：
+    //   #1 = Class "test/Counter"
+    //   #2 = UTF8 "test/Counter"
+    //   #3 = UTF8 "count"
+    //   #4 = UTF8 "I"
+    //   #5 = UTF8 "test"
+    //   #6 = UTF8 "(I)I"
+    //   #7 = NameAndType #3:#4  (count:I)
+    //   #8 = Fieldref #1.#7     (test/Counter.count:I)
+    //   #9 = UTF8 "<init>"
+    //   #10 = UTF8 "()V"
+    //   #11 = NameAndType #9:#10  (<init>:()V)
+    //   #12 = Methodref #1.#11   (test/Counter.<init>:()V)
+    ConstantPool* cp = new ConstantPool(20);
+
+    cp->utf8_at_put(2, (const u1*)"test/Counter", 12);
+    cp->klass_index_at_put(1, 2);     // #1 = Class → #2
+
+    cp->utf8_at_put(3, (const u1*)"count", 5);
+    cp->utf8_at_put(4, (const u1*)"I", 1);
+
+    cp->utf8_at_put(5, (const u1*)"test", 4);
+    cp->utf8_at_put(6, (const u1*)"(I)I", 4);
+
+    cp->name_and_type_at_put(7, 3, 4);    // #7 = NameAndType count:I
+    cp->field_at_put(8, 1, 7);             // #8 = Fieldref Counter.count:I
+
+    cp->utf8_at_put(9, (const u1*)"<init>", 6);
+    cp->utf8_at_put(10, (const u1*)"()V", 3);
+    cp->name_and_type_at_put(11, 9, 10);   // #11 = NameAndType <init>:()V
+    cp->method_at_put(12, 1, 11);           // #12 = Methodref Counter.<init>:()V
+
+    // 字段信息：一个非静态字段 count (int)
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 1, mtClass);
+    fields[0] = { 0, 3, 4, (u2)instanceOopDesc::base_offset_in_bytes(), 0 }; // count at offset 16
+
+    // 创建 InstanceKlass
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_class_name("test/Counter");
+    ik->set_constants(cp);
+    ik->set_fields(fields, 1);
+    ik->set_has_nonstatic_fields();
+
+    // instance_size = 16 (header) + 4 (count) = 20 → aligned to 24
+    int inst_size = (int)align_up((uintx)(instanceOopDesc::base_offset_in_bytes() + 4), (uintx)HeapWordSize);
+    ik->set_instance_size(inst_size);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    printf("  Class: %s, instance_size=%d\n", ik->class_name(), ik->instance_size());
+
+    // 构建测试方法字节码：
+    //   0: new #1              (BB 00 01)
+    //   3: dup                 (59)
+    //   4: invokespecial #12   (B7 00 0C) — <init>
+    //   7: astore_1            (4C)
+    //   8: aload_1             (2B)
+    //   9: bipush 42           (10 2A)
+    //  11: putfield #8         (B5 00 08)
+    //  14: aload_1             (2B)
+    //  15: getfield #8         (B4 00 08)
+    //  18: ireturn             (AC)
+    u1 code[] = {
+        0xBB, 0x00, 0x01,   // 0: new #1 (test/Counter)
+        0x59,                // 3: dup
+        0xB7, 0x00, 0x0C,   // 4: invokespecial #12 (<init>)
+        0x4C,                // 7: astore_1
+        0x2B,                // 8: aload_1
+        0x10, 0x2A,          // 9: bipush 42
+        0xB5, 0x00, 0x08,   // 11: putfield #8 (count)
+        0x2B,                // 14: aload_1
+        0xB4, 0x00, 0x08,   // 15: getfield #8 (count)
+        0xAC,                // 18: ireturn
+    };
+
+    cp->utf8_at_put(13, (const u1*)"testMethod", 10);
+    cp->utf8_at_put(14, (const u1*)"()I", 3);
+
+    ConstMethod* cm = new ConstMethod(cp, 19, 4, 2, 13, 14);
+    cm->set_bytecodes(code, 19);
+
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // 设置方法到 klass（这样 invokespecial <init> 能找到目标方法，
+    // 不过我们的 <init> 是外部类方法，会被跳过）
+    // 不需要设置 methods，因为 invoke_method 对外部类 <init> 已处理
+
+    // 创建线程并执行
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    // 验证结果
+    printf("  Result: %d (expected 42)\n", result.get_jint());
+    vm_assert(result.get_jint() == 42, "getfield should return 42 after putfield 42");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    // 堆状态
+    JavaHeap::heap()->print_on(stdout);
+
+    // 清理
+    delete method;
+    delete ik;
+    JavaHeap::destroy();
+
+    printf("  [PASS] Interpreter Object Creation & Field Access OK\n\n");
+}
+
+// ============================================================================
+// Phase 5 测试 4：静态字段读写
+// 手动构建字节码模拟：
+//   static int counter;
+//   putstatic counter = 100
+//   getstatic counter
+//   ireturn
+// ============================================================================
+
+void test_interpreter_static_fields() {
+    printf("=== Test: Interpreter Static Fields ===\n");
+
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 常量池
+    ConstantPool* cp = new ConstantPool(15);
+
+    cp->utf8_at_put(2, (const u1*)"test/StaticTest", 15);
+    cp->klass_index_at_put(1, 2);
+
+    cp->utf8_at_put(3, (const u1*)"counter", 7);
+    cp->utf8_at_put(4, (const u1*)"I", 1);
+    cp->name_and_type_at_put(5, 3, 4);   // #5 = NameAndType counter:I
+    cp->field_at_put(6, 1, 5);            // #6 = Fieldref StaticTest.counter:I
+
+    // 字段：一个静态字段 counter (int)
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 1, mtClass);
+    fields[0] = { JVM_ACC_STATIC, 3, 4, FieldInfoEntry::invalid_offset, 0 };
+
+    // 使用 create_from_parser 来自动分配静态字段存储
+    InstanceKlass* ik = InstanceKlass::create_from_parser(
+        "test/StaticTest", "java/lang/Object",
+        JVM_ACC_PUBLIC | JVM_ACC_SUPER,
+        55, 0,
+        cp,
+        fields, 1,
+        nullptr, 0
+    );
+
+    printf("  Class: %s\n", ik->class_name());
+    printf("  Static field 'counter' index: %d\n", ik->static_field_index("counter"));
+
+    // 验证静态字段初始值为 0
+    int idx = ik->static_field_index("counter");
+    vm_assert(idx == 0, "counter should be at static index 0");
+    vm_assert(ik->static_field_value(idx) == 0, "initial value should be 0");
+
+    // 构建字节码：
+    //   0: bipush 100    (10 64)
+    //   2: putstatic #6  (B3 00 06)
+    //   5: getstatic #6  (B2 00 06)
+    //   8: ireturn       (AC)
+    u1 code[] = {
+        0x10, 0x64,          // 0: bipush 100
+        0xB3, 0x00, 0x06,    // 2: putstatic #6 (counter)
+        0xB2, 0x00, 0x06,    // 5: getstatic #6 (counter)
+        0xAC,                 // 8: ireturn
+    };
+
+    cp->utf8_at_put(9, (const u1*)"testStatic", 10);
+    cp->utf8_at_put(10, (const u1*)"()I", 3);
+
+    ConstMethod* cm = new ConstMethod(cp, 9, 2, 1, 9, 10);
+    cm->set_bytecodes(code, 9);
+    Method* method = new Method(cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    printf("  Result: %d (expected 100)\n", result.get_jint());
+    vm_assert(result.get_jint() == 100, "getstatic should return 100");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    // 验证静态字段确实被修改了
+    vm_assert(ik->static_field_value(idx) == 100, "static field should be 100");
+
+    delete method;
+    delete ik;
+    JavaHeap::destroy();
+
+    printf("  [PASS] Interpreter Static Fields OK\n\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char** argv) {
     printf("========================================\n");
-    printf("  Mini JVM - Phase 4: Interpreter\n");
+    printf("  Mini JVM - Phase 5: Object Creation\n");
     printf("========================================\n\n");
 
     // Phase 1 基础测试
@@ -770,7 +1124,7 @@ int main(int argc, char** argv) {
         test_full_pipeline("test/HelloWorld.class");
     }
 
-    // Phase 4 新增测试
+    // Phase 4 测试
     test_bytecodes();
     test_java_thread();
     test_interpreter_frame();
@@ -785,8 +1139,14 @@ int main(int argc, char** argv) {
         test_full_execution("test/HelloWorld.class");
     }
 
+    // Phase 5 新增测试
+    test_java_heap_basic();
+    test_object_allocation();
+    test_interpreter_object_creation();
+    test_interpreter_static_fields();
+
     printf("========================================\n");
-    printf("  All Phase 4 tests completed!\n");
+    printf("  All Phase 5 tests completed!\n");
     printf("========================================\n");
 
     return 0;

@@ -134,6 +134,12 @@ private:
     // 父类名
     char* _super_class_name;
 
+    // ========== Phase 5: 静态字段存储 ==========
+    // HotSpot 中静态字段存在 java.lang.Class 的 mirror 对象中（InstanceMirrorKlass）
+    // 我们简化为在 InstanceKlass 中直接用 intptr_t 数组存储
+    intptr_t* _static_fields;       // 静态字段值数组
+    int       _static_fields_count; // 静态字段数量
+
     // ========== misc_flags 位定义 ==========
 
     enum {
@@ -268,6 +274,25 @@ public:
     void set_instance_size(int size) {
         set_layout_helper(Klass::instance_layout_helper(size, false));
     }
+
+    // ======== Phase 5: 对象分配 ========
+
+    // 分配一个该类的实例对象
+    // 对应 HotSpot: InstanceKlass::allocate_instance()
+    // 流程：从 JavaHeap 分配 instance_size() 字节 → 初始化对象头 → 返回 oopDesc*
+    oopDesc* allocate_instance();
+
+    // ======== Phase 5: 静态字段访问 ========
+
+    // 获取静态字段值（通过字段索引）
+    intptr_t static_field_value(int field_index) const;
+    void     set_static_field_value(int field_index, intptr_t value);
+
+    // 通过字段名查找字段信息
+    const FieldInfoEntry* find_field(const char* name) const;
+
+    // 查找字段在静态字段数组中的索引
+    int static_field_index(const char* name) const;
 
     // ======== 工厂方法 ========
 

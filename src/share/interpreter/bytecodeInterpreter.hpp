@@ -70,10 +70,32 @@ private:
                               u2 cp_index,
                               bool is_static);
 
-    // 处理 getstatic（简化版：仅支持 PrintStream.println 桩）
+    // 处理 getstatic（Phase 5: 真实静态字段访问 + System.out 桩）
     static void handle_getstatic(InterpreterFrame* frame,
                                  InstanceKlass* klass,
                                  u2 cp_index);
+
+    // 处理 putstatic（Phase 5: 真实静态字段写入）
+    static void handle_putstatic(InterpreterFrame* frame,
+                                 InstanceKlass* klass,
+                                 u2 cp_index);
+
+    // 处理 getfield（Phase 5: 真实实例字段读取）
+    static void handle_getfield(InterpreterFrame* frame,
+                                InstanceKlass* klass,
+                                u2 cp_index);
+
+    // 处理 putfield（Phase 5: 真实实例字段写入）
+    static void handle_putfield(InterpreterFrame* frame,
+                                InstanceKlass* klass,
+                                JavaThread* thread,
+                                u2 cp_index);
+
+    // 处理 new（Phase 5: 真实对象创建）
+    static void handle_new(InterpreterFrame* frame,
+                           InstanceKlass* klass,
+                           JavaThread* thread,
+                           u2 cp_index);
 
     // 处理 invokevirtual（简化版：仅支持 PrintStream.println 桩）
     static void handle_invokevirtual(InterpreterFrame* frame,
@@ -81,6 +103,9 @@ private:
                                      JavaThread* thread,
                                      u2 cp_index,
                                      JavaValue* result);
+
+    // 辅助：解析字段描述符获取字段类型（用于确定读写大小）
+    static char resolve_field_type(ConstantPool* cp, u2 cp_index);
 };
 
 #endif // SHARE_INTERPRETER_BYTECODEINTERPRETER_HPP

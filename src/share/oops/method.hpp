@@ -41,6 +41,7 @@
 
 #include "oops/metadata.hpp"
 #include "oops/constMethod.hpp"
+#include "oops/constantPool.hpp"
 #include "utilities/accessFlags.hpp"
 
 class InstanceKlass;
@@ -136,6 +137,11 @@ public:
 
     u2 name_index()      const { return _constMethod->name_index(); }
     u2 signature_index() const { return _constMethod->signature_index(); }
+
+    // 便捷方法：直接获取方法名和签名字符串
+    // 对照 HotSpot: Method::name() → constMethod()->name()
+    const char* name()      const { return constants()->utf8_at(name_index()); }
+    const char* signature() const { return constants()->utf8_at(signature_index()); }
 
     // ======== 栈/局部变量 ========
 

@@ -842,10 +842,34 @@ void BytecodeInterpreter::invoke_method(InterpreterFrame* frame,
     Method* target = klass->find_method(method_name, method_sig);
 
     if (target == nullptr) {
-        // 方法不在当前类中
-        fprintf(stderr, "WARNING: Method %s%s not found in %s\n",
-                method_name, method_sig, klass->class_name());
-        // 不设异常，继续执行（宽容模式）
+        // 方法不在当前类中 → 需要弹出参数保持栈平衡
+        if (_trace_bytecodes) {
+            fprintf(stderr, "  [INVOKE] %s%s not found in %s — skipping\n",
+                    method_name, method_sig, klass->class_name());
+        }
+        // 计算需要弹出的参数数量
+        int skip_slots = 0;
+        const char* skip_sig = method_sig;
+        if (*skip_sig == '(') skip_sig++;
+        while (*skip_sig != ')' && *skip_sig != '\0') {
+            if (*skip_sig == 'J' || *skip_sig == 'D') {
+                skip_slots += 2; skip_sig++;
+            } else if (*skip_sig == 'L') {
+                skip_slots += 1;
+                while (*skip_sig != ';' && *skip_sig != '\0') skip_sig++;
+                if (*skip_sig == ';') skip_sig++;
+            } else if (*skip_sig == '[') {
+                skip_slots += 1; skip_sig++;
+                if (*skip_sig == 'L') {
+                    while (*skip_sig != ';' && *skip_sig != '\0') skip_sig++;
+                    if (*skip_sig == ';') skip_sig++;
+                } else if (*skip_sig != '\0') { skip_sig++; }
+            } else {
+                skip_slots += 1; skip_sig++;
+            }
+        }
+        if (!is_static) skip_slots += 1; // receiver
+        for (int i = 0; i < skip_slots; i++) frame->pop_raw();
         return;
     }
 

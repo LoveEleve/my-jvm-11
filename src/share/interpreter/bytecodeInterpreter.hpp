@@ -27,7 +27,7 @@
 //   [x] 自增：    iinc
 //   [x] 条件跳转：ifeq/ne/lt/ge/gt/le, if_icmpxx
 //   [x] 无条件跳转：goto
-//   [x] 方法调用：invokestatic, invokespecial, invokevirtual (简化版)
+//   [x] 方法调用：invokestatic, invokespecial, invokevirtual (含 <init> + 实例方法)
 //   [x] 返回：    ireturn, return
 //   [x] 其他：    nop, getstatic/putstatic (输出桩)
 // ============================================================================

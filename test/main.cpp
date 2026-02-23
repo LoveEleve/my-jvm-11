@@ -1,6 +1,7 @@
 // ============================================================================
-// Mini JVM - Phase 5 测试入口
+// Mini JVM - Phase 6 测试入口
 // 测试 OOP-Klass 对象模型 + 字节码解释器 + 对象创建 + 字段访问
+// + 真实 <init> 构造函数 + 实例方法调用
 // ============================================================================
 
 #include "utilities/globalDefinitions.hpp"
@@ -1098,12 +1099,636 @@ void test_interpreter_static_fields() {
 }
 
 // ============================================================================
+// Phase 6 测试 1：<init> 构造函数执行
+//
+// 模拟：
+//   class Counter {
+//       int count;
+//       Counter() { this.count = 10; }
+//   }
+//
+// 测试字节码序列：
+//   new Counter          → 分配对象
+//   dup                  → 复制引用
+//   invokespecial <init> → 执行构造函数（this.count = 10）
+//   astore_1             → 保存到 local[1]
+//   aload_1              → 加载引用
+//   getfield count       → 读取 count
+//   ireturn              → 返回 count 的值（应该是 10）
+//
+// <init>()V 的字节码：
+//   aload_0              → 加载 this
+//   bipush 10            → 压入 10
+//   putfield count       → this.count = 10
+//   return               → void 返回
+// ============================================================================
+
+void test_init_constructor() {
+    printf("=== Test: Phase 6 - <init> Constructor Execution ===\n");
+
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 常量池布局：
+    //   #1  = Class      → #2 ("test/Counter")
+    //   #2  = UTF8       "test/Counter"
+    //   #3  = UTF8       "count"
+    //   #4  = UTF8       "I"
+    //   #5  = NameAndType #3:#4 (count:I)
+    //   #6  = Fieldref   #1.#5 (test/Counter.count:I)
+    //   #7  = UTF8       "<init>"
+    //   #8  = UTF8       "()V"
+    //   #9  = NameAndType #7:#8 (<init>:()V)
+    //   #10 = Methodref  #1.#9 (test/Counter.<init>:()V)
+    //   #11 = UTF8       "testMethod"
+    //   #12 = UTF8       "()I"
+    ConstantPool* cp = new ConstantPool(20);
+
+    cp->utf8_at_put(2, (const u1*)"test/Counter", 12);
+    cp->klass_index_at_put(1, 2);
+
+    cp->utf8_at_put(3, (const u1*)"count", 5);
+    cp->utf8_at_put(4, (const u1*)"I", 1);
+    cp->name_and_type_at_put(5, 3, 4);     // #5 = NameAndType count:I
+    cp->field_at_put(6, 1, 5);              // #6 = Fieldref Counter.count:I
+
+    cp->utf8_at_put(7, (const u1*)"<init>", 6);
+    cp->utf8_at_put(8, (const u1*)"()V", 3);
+    cp->name_and_type_at_put(9, 7, 8);     // #9 = NameAndType <init>:()V
+    cp->method_at_put(10, 1, 9);            // #10 = Methodref Counter.<init>:()V
+
+    cp->utf8_at_put(11, (const u1*)"testMethod", 10);
+    cp->utf8_at_put(12, (const u1*)"()I", 3);
+
+    // ---- 构建 <init>()V 方法 ----
+    // 字节码：
+    //   0: aload_0       (2A)         → 加载 this
+    //   1: bipush 10     (10 0A)      → 压入 10
+    //   3: putfield #6   (B5 00 06)   → this.count = 10
+    //   6: return        (B1)         → void 返回
+    u1 init_code[] = {
+        0x2A,                // 0: aload_0
+        0x10, 0x0A,          // 1: bipush 10
+        0xB5, 0x00, 0x06,    // 3: putfield #6 (count)
+        0xB1,                // 6: return
+    };
+    ConstMethod* init_cm = new ConstMethod(cp, 7, 2, 1, 7, 8);
+    // max_stack=2 (this + value), max_locals=1 (this)
+    init_cm->set_bytecodes(init_code, 7);
+    Method* init_method = new Method(init_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- 构建 testMethod()I （调用者方法） ----
+    // 字节码：
+    //   0: new #1              (BB 00 01)
+    //   3: dup                 (59)
+    //   4: invokespecial #10   (B7 00 0A)  → <init>
+    //   7: astore_1            (4C)
+    //   8: aload_1             (2B)
+    //   9: getfield #6         (B4 00 06)  → count
+    //  12: ireturn             (AC)
+    u1 test_code[] = {
+        0xBB, 0x00, 0x01,   // 0: new #1 (test/Counter)
+        0x59,                // 3: dup
+        0xB7, 0x00, 0x0A,   // 4: invokespecial #10 (<init>)
+        0x4C,                // 7: astore_1
+        0x2B,                // 8: aload_1
+        0xB4, 0x00, 0x06,   // 9: getfield #6 (count)
+        0xAC,                // 12: ireturn
+    };
+    ConstMethod* test_cm = new ConstMethod(cp, 13, 4, 2, 11, 12);
+    // max_stack=4, max_locals=2 (local[0]=unused, local[1]=obj)
+    test_cm->set_bytecodes(test_code, 13);
+    Method* test_method = new Method(test_cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // ---- 构建字段信息 ----
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 1, mtClass);
+    fields[0] = { 0, 3, 4, (u2)instanceOopDesc::base_offset_in_bytes(), 0 }; // count at offset 16
+
+    // ---- 构建方法数组（包含 <init>） ----
+    Method** methods = NEW_C_HEAP_ARRAY(Method*, 1, mtClass);
+    methods[0] = init_method;
+
+    // ---- 创建 InstanceKlass ----
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_class_name("test/Counter");
+    ik->set_constants(cp);
+    ik->set_fields(fields, 1);
+    ik->set_methods(methods, 1);
+    ik->set_has_nonstatic_fields();
+
+    int inst_size = (int)align_up((uintx)(instanceOopDesc::base_offset_in_bytes() + 4), (uintx)HeapWordSize);
+    ik->set_instance_size(inst_size);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    printf("  Class: %s, instance_size=%d\n", ik->class_name(), ik->instance_size());
+
+    // ---- 执行 ----
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(test_method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    // ---- 验证 ----
+    printf("  Result: %d (expected 10)\n", result.get_jint());
+    vm_assert(result.get_jint() == 10, "<init> should set count to 10");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    // 清理 — test_method 不在 ik->methods() 中，需要手动删除
+    delete test_method;
+    delete ik;  // 会删除 cp, fields, methods 数组, init_method(通过 methods[0])
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 6 - <init> Constructor Execution OK\n\n");
+}
+
+// ============================================================================
+// Phase 6 测试 2：实例方法调用（invokevirtual）
+//
+// 模拟：
+//   class Calculator {
+//       int value;
+//       Calculator() { this.value = 0; }
+//       int addAndGet(int n) { this.value = this.value + n; return this.value; }
+//   }
+//
+// 测试字节码序列（testMethod()I）：
+//   new Calculator       → 分配对象
+//   dup                  → 复制引用
+//   invokespecial <init> → 执行构造函数
+//   astore_1             → obj → local[1]
+//   aload_1              → push obj
+//   bipush 42            → push 42
+//   invokevirtual addAndGet → obj.addAndGet(42) → 42
+//   ireturn              → 返回 42
+//
+// <init>()V：
+//   aload_0              → this
+//   iconst_0             → 0
+//   putfield value       → this.value = 0
+//   return
+//
+// addAndGet(I)I：
+//   aload_0              → this
+//   aload_0              → this
+//   getfield value       → this.value
+//   iload_1              → n
+//   iadd                 → this.value + n
+//   putfield value       → this.value = this.value + n
+//   aload_0              → this
+//   getfield value       → this.value
+//   ireturn              → return this.value
+// ============================================================================
+
+void test_invokevirtual_instance_method() {
+    printf("=== Test: Phase 6 - invokevirtual Instance Method ===\n");
+
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 常量池布局：
+    //   #1  = Class        → #2
+    //   #2  = UTF8         "test/Calculator"
+    //   #3  = UTF8         "value"
+    //   #4  = UTF8         "I"
+    //   #5  = NameAndType  #3:#4 (value:I)
+    //   #6  = Fieldref     #1.#5 (test/Calculator.value:I)
+    //   #7  = UTF8         "<init>"
+    //   #8  = UTF8         "()V"
+    //   #9  = NameAndType  #7:#8 (<init>:()V)
+    //   #10 = Methodref    #1.#9 (test/Calculator.<init>:()V)
+    //   #11 = UTF8         "addAndGet"
+    //   #12 = UTF8         "(I)I"
+    //   #13 = NameAndType  #11:#12 (addAndGet:(I)I)
+    //   #14 = Methodref    #1.#13 (test/Calculator.addAndGet:(I)I)
+    //   #15 = UTF8         "testMethod"
+    //   #16 = UTF8         "()I"
+    ConstantPool* cp = new ConstantPool(20);
+
+    cp->utf8_at_put(2, (const u1*)"test/Calculator", 15);
+    cp->klass_index_at_put(1, 2);
+
+    cp->utf8_at_put(3, (const u1*)"value", 5);
+    cp->utf8_at_put(4, (const u1*)"I", 1);
+    cp->name_and_type_at_put(5, 3, 4);
+    cp->field_at_put(6, 1, 5);
+
+    cp->utf8_at_put(7, (const u1*)"<init>", 6);
+    cp->utf8_at_put(8, (const u1*)"()V", 3);
+    cp->name_and_type_at_put(9, 7, 8);
+    cp->method_at_put(10, 1, 9);
+
+    cp->utf8_at_put(11, (const u1*)"addAndGet", 9);
+    cp->utf8_at_put(12, (const u1*)"(I)I", 4);
+    cp->name_and_type_at_put(13, 11, 12);
+    cp->method_at_put(14, 1, 13);
+
+    cp->utf8_at_put(15, (const u1*)"testMethod", 10);
+    cp->utf8_at_put(16, (const u1*)"()I", 3);
+
+    // ---- <init>()V ----
+    //   0: aload_0       (2A)
+    //   1: iconst_0      (03)
+    //   2: putfield #6   (B5 00 06)
+    //   5: return        (B1)
+    u1 init_code[] = {
+        0x2A,                // 0: aload_0
+        0x03,                // 1: iconst_0
+        0xB5, 0x00, 0x06,    // 2: putfield #6 (value)
+        0xB1,                // 5: return
+    };
+    ConstMethod* init_cm = new ConstMethod(cp, 6, 2, 1, 7, 8);
+    init_cm->set_bytecodes(init_code, 6);
+    Method* init_method = new Method(init_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- addAndGet(I)I ----
+    //   0: aload_0       (2A)       → this
+    //   1: aload_0       (2A)       → this
+    //   2: getfield #6   (B4 00 06) → this.value
+    //   5: iload_1       (1B)       → n
+    //   6: iadd          (60)       → this.value + n
+    //   7: putfield #6   (B5 00 06) → this.value = this.value + n
+    //  10: aload_0       (2A)       → this
+    //  11: getfield #6   (B4 00 06) → this.value
+    //  14: ireturn       (AC)       → return this.value
+    u1 add_code[] = {
+        0x2A,                // 0: aload_0
+        0x2A,                // 1: aload_0
+        0xB4, 0x00, 0x06,    // 2: getfield #6 (value)
+        0x1B,                // 5: iload_1
+        0x60,                // 6: iadd
+        0xB5, 0x00, 0x06,    // 7: putfield #6 (value)
+        0x2A,                // 10: aload_0
+        0xB4, 0x00, 0x06,    // 11: getfield #6 (value)
+        0xAC,                // 14: ireturn
+    };
+    ConstMethod* add_cm = new ConstMethod(cp, 15, 3, 2, 11, 12);
+    // max_stack=3 (this + this.value + n), max_locals=2 (this + n)
+    add_cm->set_bytecodes(add_code, 15);
+    Method* add_method = new Method(add_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- testMethod()I ----
+    //   0: new #1              (BB 00 01)
+    //   3: dup                 (59)
+    //   4: invokespecial #10   (B7 00 0A)  → <init>
+    //   7: astore_1            (4C)
+    //   8: aload_1             (2B)
+    //   9: bipush 42           (10 2A)
+    //  11: invokevirtual #14   (B6 00 0E)  → addAndGet(42)
+    //  14: ireturn             (AC)
+    u1 test_code[] = {
+        0xBB, 0x00, 0x01,   // 0: new #1
+        0x59,                // 3: dup
+        0xB7, 0x00, 0x0A,   // 4: invokespecial #10
+        0x4C,                // 7: astore_1
+        0x2B,                // 8: aload_1
+        0x10, 0x2A,          // 9: bipush 42
+        0xB6, 0x00, 0x0E,   // 11: invokevirtual #14
+        0xAC,                // 14: ireturn
+    };
+    ConstMethod* test_cm = new ConstMethod(cp, 15, 4, 2, 15, 16);
+    test_cm->set_bytecodes(test_code, 15);
+    Method* test_method = new Method(test_cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // ---- 字段 ----
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 1, mtClass);
+    fields[0] = { 0, 3, 4, (u2)instanceOopDesc::base_offset_in_bytes(), 0 }; // value at offset 16
+
+    // ---- 方法数组（<init> + addAndGet）----
+    Method** methods_arr = NEW_C_HEAP_ARRAY(Method*, 2, mtClass);
+    methods_arr[0] = init_method;
+    methods_arr[1] = add_method;
+
+    // ---- InstanceKlass ----
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_class_name("test/Calculator");
+    ik->set_constants(cp);
+    ik->set_fields(fields, 1);
+    ik->set_methods(methods_arr, 2);
+    ik->set_has_nonstatic_fields();
+
+    int inst_size = (int)align_up((uintx)(instanceOopDesc::base_offset_in_bytes() + 4), (uintx)HeapWordSize);
+    ik->set_instance_size(inst_size);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    printf("  Class: %s, instance_size=%d\n", ik->class_name(), ik->instance_size());
+    printf("  Methods: <init>()V, addAndGet(I)I\n");
+
+    // ---- 执行 ----
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(test_method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    // ---- 验证 ----
+    printf("  Result: %d (expected 42)\n", result.get_jint());
+    vm_assert(result.get_jint() == 42, "addAndGet(42) should return 42");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    // 清理
+    delete test_method;
+    delete ik;
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 6 - invokevirtual Instance Method OK\n\n");
+}
+
+// ============================================================================
+// Phase 6 测试 3：多次实例方法调用（累加）
+//
+// 模拟：
+//   class Accumulator {
+//       int sum;
+//       Accumulator() { this.sum = 0; }
+//       int add(int n) { this.sum = this.sum + n; return this.sum; }
+//   }
+//
+// 测试：创建对象 → add(10) → add(20) → add(30) → return sum
+// 期望结果：60
+// ============================================================================
+
+void test_multiple_method_calls() {
+    printf("=== Test: Phase 6 - Multiple Method Calls (Accumulator) ===\n");
+
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 常量池
+    ConstantPool* cp = new ConstantPool(20);
+
+    cp->utf8_at_put(2, (const u1*)"test/Accumulator", 16);
+    cp->klass_index_at_put(1, 2);
+
+    cp->utf8_at_put(3, (const u1*)"sum", 3);
+    cp->utf8_at_put(4, (const u1*)"I", 1);
+    cp->name_and_type_at_put(5, 3, 4);
+    cp->field_at_put(6, 1, 5);
+
+    cp->utf8_at_put(7, (const u1*)"<init>", 6);
+    cp->utf8_at_put(8, (const u1*)"()V", 3);
+    cp->name_and_type_at_put(9, 7, 8);
+    cp->method_at_put(10, 1, 9);
+
+    cp->utf8_at_put(11, (const u1*)"add", 3);
+    cp->utf8_at_put(12, (const u1*)"(I)I", 4);
+    cp->name_and_type_at_put(13, 11, 12);
+    cp->method_at_put(14, 1, 13);
+
+    cp->utf8_at_put(15, (const u1*)"testMethod", 10);
+    cp->utf8_at_put(16, (const u1*)"()I", 3);
+
+    // ---- <init>()V ----
+    u1 init_code[] = {
+        0x2A,                // aload_0
+        0x03,                // iconst_0
+        0xB5, 0x00, 0x06,    // putfield #6 (sum)
+        0xB1,                // return
+    };
+    ConstMethod* init_cm = new ConstMethod(cp, 6, 2, 1, 7, 8);
+    init_cm->set_bytecodes(init_code, 6);
+    Method* init_method = new Method(init_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- add(I)I ----
+    //   this.sum = this.sum + n; return this.sum;
+    u1 add_code[] = {
+        0x2A,                // 0: aload_0
+        0x2A,                // 1: aload_0
+        0xB4, 0x00, 0x06,    // 2: getfield #6 (sum)
+        0x1B,                // 5: iload_1
+        0x60,                // 6: iadd
+        0xB5, 0x00, 0x06,    // 7: putfield #6 (sum)
+        0x2A,                // 10: aload_0
+        0xB4, 0x00, 0x06,    // 11: getfield #6 (sum)
+        0xAC,                // 14: ireturn
+    };
+    ConstMethod* add_cm = new ConstMethod(cp, 15, 3, 2, 11, 12);
+    add_cm->set_bytecodes(add_code, 15);
+    Method* add_method = new Method(add_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- testMethod()I ----
+    //   new → dup → <init> → astore_1
+    //   aload_1 → bipush 10 → invokevirtual add → pop (丢弃返回值)
+    //   aload_1 → bipush 20 → invokevirtual add → pop
+    //   aload_1 → bipush 30 → invokevirtual add → ireturn (返回最后一次 add 的结果)
+    u1 test_code[] = {
+        0xBB, 0x00, 0x01,   //  0: new #1
+        0x59,                //  3: dup
+        0xB7, 0x00, 0x0A,   //  4: invokespecial #10 (<init>)
+        0x4C,                //  7: astore_1
+        // add(10) → pop
+        0x2B,                //  8: aload_1
+        0x10, 0x0A,          //  9: bipush 10
+        0xB6, 0x00, 0x0E,   // 11: invokevirtual #14 (add)
+        0x57,                // 14: pop
+        // add(20) → pop
+        0x2B,                // 15: aload_1
+        0x10, 0x14,          // 16: bipush 20
+        0xB6, 0x00, 0x0E,   // 18: invokevirtual #14 (add)
+        0x57,                // 21: pop
+        // add(30) → return result
+        0x2B,                // 22: aload_1
+        0x10, 0x1E,          // 23: bipush 30
+        0xB6, 0x00, 0x0E,   // 25: invokevirtual #14 (add)
+        0xAC,                // 28: ireturn
+    };
+    ConstMethod* test_cm = new ConstMethod(cp, 29, 4, 2, 15, 16);
+    test_cm->set_bytecodes(test_code, 29);
+    Method* test_method = new Method(test_cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // ---- 字段 ----
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 1, mtClass);
+    fields[0] = { 0, 3, 4, (u2)instanceOopDesc::base_offset_in_bytes(), 0 };
+
+    // ---- 方法 ----
+    Method** methods_arr = NEW_C_HEAP_ARRAY(Method*, 2, mtClass);
+    methods_arr[0] = init_method;
+    methods_arr[1] = add_method;
+
+    // ---- InstanceKlass ----
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_class_name("test/Accumulator");
+    ik->set_constants(cp);
+    ik->set_fields(fields, 1);
+    ik->set_methods(methods_arr, 2);
+    ik->set_has_nonstatic_fields();
+
+    int inst_size = (int)align_up((uintx)(instanceOopDesc::base_offset_in_bytes() + 4), (uintx)HeapWordSize);
+    ik->set_instance_size(inst_size);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    printf("  Class: %s\n", ik->class_name());
+    printf("  Testing: new → <init> → add(10) → add(20) → add(30)\n");
+
+    // ---- 执行 ----
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = false; // 关闭 trace，输出太长
+    BytecodeInterpreter::execute(test_method, ik, &thread, &result);
+
+    // ---- 验证 ----
+    printf("  Result: %d (expected 60)\n", result.get_jint());
+    vm_assert(result.get_jint() == 60, "10 + 20 + 30 = 60");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete test_method;
+    delete ik;
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 6 - Multiple Method Calls OK\n\n");
+}
+
+// ============================================================================
+// Phase 6 测试 4：<init> 带参数的构造函数
+//
+// 模拟：
+//   class Point {
+//       int x; int y;
+//       Point(int x, int y) { this.x = x; this.y = y; }
+//       int sum() { return this.x + this.y; }
+//   }
+//
+// 测试：new Point → dup → invokespecial <init>(3, 7) → sum() → return 10
+// ============================================================================
+
+void test_init_with_args() {
+    printf("=== Test: Phase 6 - <init> With Arguments ===\n");
+
+    JavaHeap::initialize(1 * 1024 * 1024);
+
+    // 常量池
+    ConstantPool* cp = new ConstantPool(25);
+
+    cp->utf8_at_put(2, (const u1*)"test/Point", 10);
+    cp->klass_index_at_put(1, 2);
+
+    // 字段
+    cp->utf8_at_put(3, (const u1*)"x", 1);
+    cp->utf8_at_put(4, (const u1*)"I", 1);
+    cp->name_and_type_at_put(5, 3, 4);      // x:I
+    cp->field_at_put(6, 1, 5);              // Fieldref Point.x:I
+
+    cp->utf8_at_put(7, (const u1*)"y", 1);
+    // descriptor "I" 复用 #4
+    cp->name_and_type_at_put(8, 7, 4);      // y:I
+    cp->field_at_put(9, 1, 8);              // Fieldref Point.y:I
+
+    // <init>(II)V
+    cp->utf8_at_put(10, (const u1*)"<init>", 6);
+    cp->utf8_at_put(11, (const u1*)"(II)V", 5);
+    cp->name_and_type_at_put(12, 10, 11);
+    cp->method_at_put(13, 1, 12);           // Methodref Point.<init>:(II)V
+
+    // sum()I
+    cp->utf8_at_put(14, (const u1*)"sum", 3);
+    cp->utf8_at_put(15, (const u1*)"()I", 3);
+    cp->name_and_type_at_put(16, 14, 15);
+    cp->method_at_put(17, 1, 16);           // Methodref Point.sum:()I
+
+    // testMethod
+    cp->utf8_at_put(18, (const u1*)"testMethod", 10);
+    cp->utf8_at_put(19, (const u1*)"()I", 3);
+
+    // ---- <init>(II)V ----
+    //   aload_0 → iload_1 → putfield x → aload_0 → iload_2 → putfield y → return
+    u1 init_code[] = {
+        0x2A,                // 0: aload_0  (this)
+        0x1B,                // 1: iload_1  (x)
+        0xB5, 0x00, 0x06,    // 2: putfield #6 (this.x = x)
+        0x2A,                // 5: aload_0  (this)
+        0x1C,                // 6: iload_2  (y)
+        0xB5, 0x00, 0x09,    // 7: putfield #9 (this.y = y)
+        0xB1,                // 10: return
+    };
+    ConstMethod* init_cm = new ConstMethod(cp, 11, 3, 3, 10, 11);
+    // max_stack=3 (this + value + ...), max_locals=3 (this, x, y)
+    init_cm->set_bytecodes(init_code, 11);
+    Method* init_method = new Method(init_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- sum()I ----
+    //   aload_0 → getfield x → aload_0 → getfield y → iadd → ireturn
+    u1 sum_code[] = {
+        0x2A,                // 0: aload_0
+        0xB4, 0x00, 0x06,    // 1: getfield #6 (x)
+        0x2A,                // 4: aload_0
+        0xB4, 0x00, 0x09,    // 5: getfield #9 (y)
+        0x60,                // 8: iadd
+        0xAC,                // 9: ireturn
+    };
+    ConstMethod* sum_cm = new ConstMethod(cp, 10, 3, 1, 14, 15);
+    sum_cm->set_bytecodes(sum_code, 10);
+    Method* sum_method = new Method(sum_cm, AccessFlags(JVM_ACC_PUBLIC));
+
+    // ---- testMethod()I ----
+    //   new Point → dup → iconst_3 → bipush 7 → invokespecial <init>(3,7)
+    //   → astore_1 → aload_1 → invokevirtual sum() → ireturn
+    u1 test_code[] = {
+        0xBB, 0x00, 0x01,   //  0: new #1 (Point)
+        0x59,                //  3: dup
+        0x06,                //  4: iconst_3
+        0x10, 0x07,          //  5: bipush 7
+        0xB7, 0x00, 0x0D,   //  7: invokespecial #13 (<init>(II)V)
+        0x4C,                // 10: astore_1
+        0x2B,                // 11: aload_1
+        0xB6, 0x00, 0x11,   // 12: invokevirtual #17 (sum()I)
+        0xAC,                // 15: ireturn
+    };
+    ConstMethod* test_cm = new ConstMethod(cp, 16, 5, 2, 18, 19);
+    test_cm->set_bytecodes(test_code, 16);
+    Method* test_method = new Method(test_cm, AccessFlags(JVM_ACC_PUBLIC | JVM_ACC_STATIC));
+
+    // ---- 字段 ----
+    FieldInfoEntry* fields = NEW_C_HEAP_ARRAY(FieldInfoEntry, 2, mtClass);
+    fields[0] = { 0, 3, 4, (u2)instanceOopDesc::base_offset_in_bytes(), 0 };      // x at 16
+    fields[1] = { 0, 7, 4, (u2)(instanceOopDesc::base_offset_in_bytes() + 4), 0 }; // y at 20
+
+    // ---- 方法 ----
+    Method** methods_arr = NEW_C_HEAP_ARRAY(Method*, 2, mtClass);
+    methods_arr[0] = init_method;
+    methods_arr[1] = sum_method;
+
+    // ---- InstanceKlass ----
+    InstanceKlass* ik = new InstanceKlass();
+    ik->set_class_name("test/Point");
+    ik->set_constants(cp);
+    ik->set_fields(fields, 2);
+    ik->set_methods(methods_arr, 2);
+    ik->set_has_nonstatic_fields();
+
+    int inst_size = (int)align_up((uintx)(instanceOopDesc::base_offset_in_bytes() + 8), (uintx)HeapWordSize);
+    ik->set_instance_size(inst_size);
+    ik->set_init_state(InstanceKlass::fully_initialized);
+
+    printf("  Class: %s, instance_size=%d\n", ik->class_name(), ik->instance_size());
+    printf("  Testing: new Point(3, 7) → sum() → expect 10\n");
+
+    // ---- 执行 ----
+    JavaThread thread("test");
+    JavaValue result(T_INT);
+
+    BytecodeInterpreter::_trace_bytecodes = true;
+    BytecodeInterpreter::execute(test_method, ik, &thread, &result);
+    BytecodeInterpreter::_trace_bytecodes = false;
+
+    // ---- 验证 ----
+    printf("  Result: %d (expected 10)\n", result.get_jint());
+    vm_assert(result.get_jint() == 10, "Point(3,7).sum() should be 10");
+    vm_assert(!thread.has_pending_exception(), "no exception");
+
+    delete test_method;
+    delete ik;
+    JavaHeap::destroy();
+
+    printf("  [PASS] Phase 6 - <init> With Arguments OK\n\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char** argv) {
     printf("========================================\n");
-    printf("  Mini JVM - Phase 5: Object Creation\n");
+    printf("  Mini JVM - Phase 6: Method Calls\n");
     printf("========================================\n\n");
 
     // Phase 1 基础测试
@@ -1139,14 +1764,20 @@ int main(int argc, char** argv) {
         test_full_execution("test/HelloWorld.class");
     }
 
-    // Phase 5 新增测试
+    // Phase 5 测试
     test_java_heap_basic();
     test_object_allocation();
     test_interpreter_object_creation();
     test_interpreter_static_fields();
 
+    // Phase 6 新增测试
+    test_init_constructor();
+    test_invokevirtual_instance_method();
+    test_multiple_method_calls();
+    test_init_with_args();
+
     printf("========================================\n");
-    printf("  All Phase 5 tests completed!\n");
+    printf("  All Phase 6 tests completed!\n");
     printf("========================================\n");
 
     return 0;

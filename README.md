@@ -201,6 +201,50 @@ JVM 内部使用的基础数据结构，是其他所有模块的地基。
 
 ---
 
+### 模块 11：Java 内存模型（JMM）⬜
+
+还原目标：happens-before 规则 + volatile 内存屏障 + CAS 原子操作
+
+| 机制 | OpenJDK 11 参考 | 还原要点 |
+|------|----------------|----------|
+| happens-before 规则 | `orderAccess.hpp` | 6 条规则的底层实现：程序顺序/监视器/volatile/线程启动/线程终止/传递性 |
+| volatile 读写屏障 | `orderAccess_linux_x86.inline.hpp` | StoreLoad/LoadLoad/StoreStore/LoadStore 四种屏障的 x86 实现 |
+| CAS 原子操作 | `atomic.hpp` / `atomic_linux_x86.inline.hpp` | `cmpxchg` 指令封装、lock 前缀保证原子性 |
+| final 字段语义 | `classFileParser.cpp` | final 字段写屏障、构造函数结束后可见性保证 |
+| 内存模型与 GC 的交互 | `g1BarrierSet.hpp` | SATB 写屏障与 JMM 写屏障的协同 |
+
+---
+
+### 模块 12：invokedynamic / MethodHandle⬜
+
+还原目标：Lambda 实现原理 + invokedynamic 字节码 + CallSite 链
+
+| 机制 | OpenJDK 11 参考 | 还原要点 |
+|------|----------------|----------|
+| invokedynamic 字节码 | `bytecodeInterpreter.cpp` | bootstrap 方法首次调用、CallSite 绑定、后续直接调用 |
+| BootstrapMethod 解析 | `constantPool.cpp` | BootstrapMethods 属性解析、bootstrap 方法句柄构建 |
+| MethodHandle 链 | `methodHandles.cpp` | BoundMethodHandle / DirectMethodHandle / AdapterMethodHandle |
+| CallSite 体系 | `java.lang.invoke` | ConstantCallSite / MutableCallSite / VolatileCallSite |
+| Lambda 实现 | `LambdaMetafactory` | invokedynamic → 匿名类生成 → 函数式接口实现 |
+| MethodType | `methodType.hpp` | 参数类型描述符、类型匹配与适配 |
+
+---
+
+### 模块 13：Instrumentation / Java Agent⬜
+
+还原目标：JVMTI 接口 + Java Agent 加载 + 字节码增强
+
+| 机制 | OpenJDK 11 参考 | 还原要点 |
+|------|----------------|----------|
+| JVMTI 接口 | `jvmtiEnv.cpp` | JVMTI 函数表、事件回调注册、能力（Capability）管理 |
+| Java Agent 加载 | `instrumentationImpl.cpp` | premain（启动时）/ agentmain（运行时 attach）两种加载方式 |
+| 字节码增强 | `classFileLoadHook` | `ClassFileLoadHook` 事件、字节码替换机制 |
+| Attach 机制 | `attachListener.cpp` | Unix domain socket、attach 命令处理 |
+| Instrumentation API | `java.lang.instrument` | `redefineClasses` / `retransformClasses` 实现 |
+| JVMTI 事件体系 | `jvmtiEventController.cpp` | 50+ 事件类型、线程级/全局级事件过滤 |
+
+---
+
 ## 实现原则
 
 1. **数据结构优先**：每个模块先完整实现数据结构，再实现算法
@@ -236,6 +280,9 @@ my_jvm/
 │   ├── gc/             # GC 实现：G1 Young GC / Mixed GC
 │   ├── compiler/       # JIT 编译：热点检测 / CompileBroker / CodeCache
 │   ├── runtime/        # 运行时服务：异常 / JNI / 信号
+│   ├── jmm/            # Java 内存模型：happens-before / volatile 屏障 / CAS
+│   ├── invoke_dynamic/ # invokedynamic / MethodHandle / Lambda 实现
+│   ├── instrumentation/# Java Agent / JVMTI / 字节码增强
 │   └── main.cpp        # 入口
 ├── test/               # 测试用 .class 文件
 ├── docs/               # 每个模块的设计说明（对应 OpenJDK 11 源码位置）
@@ -260,3 +307,6 @@ my_jvm/
 | 8. gc GC 实现 | ⬜ 未开始 | `new-jvm-md/G1GC/` |
 | 9. compiler JIT | ⬜ 未开始 | `new-jvm-md/Compiler/` `new-jvm-md/InvocationCounter/` |
 | 10. runtime 运行时服务 | ⬜ 未开始 | `new-jvm-md/ExceptionHandling/` `new-jvm-md/SOLibrary/` |
+| 11. JMM Java 内存模型 | ⬜ 未开始 | `new-jvm-md/JMM/` |
+| 12. invokedynamic / MethodHandle | ⬜ 未开始 | `new-jvm-md/MethodHandles/` |
+| 13. Instrumentation / Java Agent | ⬜ 未开始 | `new-jvm-md/Instrumentation/` |
